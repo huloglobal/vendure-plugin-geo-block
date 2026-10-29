@@ -4,10 +4,10 @@
   "description": "Geo-restrict your Vendure storefront by country, UK region or curated region presets (EU, EEA, British Isles, Europe, North America, Oceania, Worldwide-with-denylist). Per-channel settings exposed as Channel custom fields plus a dedicated admin page with a live preview of the resolved allow-list.",
   "license": "AGPL-3.0-or-later",
   "author": "Wayne Garrison <wayne@garrison.me.uk>",
-  "homepage": "https://github.com/exceeded/vendure-plugin-geo-block",
+  "homepage": "https://github.com/huloglobal/vendure-plugin-geo-block",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/exceeded/vendure-plugin-geo-block.git"
+    "url": "git+https://github.com/huloglobal/vendure-plugin-geo-block.git"
   },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
