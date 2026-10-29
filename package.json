@@ -45,7 +45,7 @@
   },
   "devDependencies": {
     "@huloglobal/vendure-licence-sdk": "^0.15.1",
-    "@nestjs/common": "^10.0.0",
+    "@nestjs/common": "^12.2.0",
     "@vendure/core": "^3.7.3",
     "nodemailer": "^6.9.0",
     "typeorm": "^0.3.0",
