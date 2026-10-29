@@ -49,7 +49,7 @@
     "@vendure/core": "^3.7.3",
     "nodemailer": "^6.9.0",
     "typeorm": "^0.3.0",
-    "typescript": "^5.4.0"
+    "typescript": "^7.0.2"
   },
   "keywords": [
     "vendure",
