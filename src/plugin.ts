@@ -40,6 +40,15 @@ export interface GeoBlockPluginOptions {
      *  from clients, e.g. `['cf-connecting-ip']` behind Cloudflare. Default:
      *  none — `req.ip` with Express `trust proxy` is used. */
     trustedIpHeaders?: Array<'cf-connecting-ip' | 'true-client-ip' | 'x-real-ip' | 'x-forwarded-for'>;
+    /** Edge headers that carry the visitor's country (and, with
+     *  `cf-ipcountry`, Cloudflare's `cf-region-code`). Default (unset): the
+     *  Cloudflare, Akamai and Fastly headers, believed ONLY when the request
+     *  reached Vendure through a proxy trusted by Express `trust proxy`
+     *  (Vendure `apiOptions.trustProxy`) — a client connecting directly can
+     *  send any `CF-IPCountry` it likes. Set a list to trust exactly those
+     *  headers on every request (only if your edge sets AND strips them), or
+     *  `[]` to ignore country headers entirely. */
+    trustedCountryHeaders?: Array<'cf-ipcountry' | 'x-akamai-edgescape' | 'x-country-code'>;
     /** Rate limit for public endpoints, keyed by IP. Default 120/60s. */
     rateLimit?: { capacity: number; windowMs: number };
     /** Per-install salt for hashing IPs stored in the audit log. When unset

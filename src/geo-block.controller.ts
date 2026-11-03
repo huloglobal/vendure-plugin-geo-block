@@ -7,7 +7,7 @@ import {
     RateLimiter,
     startRetentionSweeper,
     verifySignedValue, LicenceStore, performSelfUpdate, selfUpdateEnv, adapterFor, PurchaseClaimClient, evalInstanceId, describeLicence } from '@huloglobal/vendure-licence-sdk';
-import { Ctx, Logger, Permission, ProcessContext, RequestContext, TransactionalConnection } from '@vendure/core';
+import { Channel, Ctx, Logger, Permission, ProcessContext, RequestContext, TransactionalConnection } from '@vendure/core';
 import { Request, Response } from 'express';
 import { GeoBlockEvent } from './geo-block-event.entity';
 import { SUBDIVISIONS, hasSubdivisions } from './subdivisions';
@@ -20,6 +20,7 @@ import {
     resolveAllowedCountries,
 } from './geo-regions';
 import { ensureStoredSecret } from './stored-secret';
+import { channelPermitted, isSuperAdmin, permittedChannelIds } from './channel-access';
 import { GeoBlockPlugin, getOptions } from './plugin';
 import { getRealIp, getResolvedCountry, getResolvedRegion, normaliseIp } from './proxy-headers';
 import { isAllowlistedBot, matchedBotEntry } from './bot-detect';
@@ -494,8 +495,8 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
                 overrideRegion = queryRegion;
             }
         }
-        const country = overrideCountry || getResolvedCountry(req) || null;
-        const region = overrideRegion || getResolvedRegion(req) || null;
+        const country = overrideCountry || getResolvedCountry(req, opts.trustedCountryHeaders) || null;
+        const region = overrideRegion || getResolvedRegion(req, opts.trustedCountryHeaders) || null;
         const referer = String(req.headers.referer || '').slice(0, 2048);
 
         const allowlist = parseList(row.ipAllowlist || '');
@@ -656,7 +657,9 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
              FROM channel
              ORDER BY id`,
         );
-        const result = rows.map((r: any) => {
+        // Only the channels this administrator may read (tokens + IP allowlists are sensitive).
+        const visible = rows.filter((r: any) => channelPermitted(ctx, { id: r.id }, [Permission.ReadCatalog]));
+        const result = visible.map((r: any) => {
             const allowedRegions = parseList(r.allowedRegions);
             const extraAllowed = parseList(r.extraAllowed);
             const blockedCountries = parseList(r.blockedCountries);
@@ -691,6 +694,12 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
         if (!requireAdmin(ctx, res, true)) return;
         if (!body?.token || typeof body.token !== 'string') {
             return res.status(400).json({ error: 'channel token required' });
+        }
+        // The body names the channel: the caller must hold UpdateCatalog in THAT channel,
+        // not just in the one its vendure-token header selects.
+        if (!channelPermitted(ctx, { token: body.token }, [Permission.UpdateCatalog])
+            || !(await this.loadChannelRowUncached(body.token))) {
+            return res.status(404).json({ error: 'channel not found' });
         }
         // Validate what goes into the TEXT columns: bounded lists of known
         // codes, parseable IPs/CIDRs (no /0 footgun), http(s) URLs only —
@@ -739,7 +748,7 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
             }
             return JSON.stringify(out);
         };
-        const updated = await adapterFor(this.connection.rawConnection).query(
+        await adapterFor(this.connection.rawConnection).query(
             `UPDATE channel
              SET \`customFieldsGeoblockenabled\` = ?,
                  \`customFieldsGeoblockmode\` = ?,
@@ -767,10 +776,8 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
                 httpUrl(body.blockLogoUrl),
                 body.token,
             ],
-            { needAffected: true },
         );
         this.rowCache.delete(String(body.token));
-        if (!updated.affectedRows) return res.status(404).json({ error: 'channel not found' });
         return res.json({ ok: true, rejected });
     }
 
@@ -787,11 +794,15 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
         const days = Math.min(Math.max(parseInt((req.query as any).days || '30', 10) || 30, 1), 365);
         const channelId = (req.query as any).channelId
             ? parseInt(String((req.query as any).channelId), 10) : null;
+        if (channelId && !channelPermitted(ctx, { id: channelId }, [Permission.ReadCatalog])) {
+            return res.status(404).json({ error: 'channel not found' });
+        }
+        // Without a channelId: every channel this administrator may read.
+        const scope = channelId ? [channelId] : permittedChannelIds(ctx, [Permission.ReadCatalog]);
+        if (!scope.length) return res.json({ days, channelId, totals: {}, topCountries: [], series: [], reasons: [] });
         // geo_block_event is a TypeORM entity table: its camelCase columns are quoted on Postgres.
-        const where = channelId
-            ? '\`createdAt\` >= DATE_SUB(NOW(), INTERVAL ? DAY) AND \`channelId\` = ?'
-            : '\`createdAt\` >= DATE_SUB(NOW(), INTERVAL ? DAY)';
-        const params = channelId ? [days, channelId] : [days];
+        const where = `\`createdAt\` >= DATE_SUB(NOW(), INTERVAL ? DAY) AND \`channelId\` IN (${scope.map(() => '?').join(', ')})`;
+        const params = [days, ...scope];
 
         const top = await adapterFor(this.connection.rawConnection).query(
             `SELECT country, COUNT(*) AS n
@@ -841,8 +852,8 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
         if (!GeoBlockPlugin.hasPremiumAccess()) {
             return res.status(402).json(premiumFeatureError('vendure-plugin-geo-block'));
         }
-        if (!body?.token) return res.status(400).json({ error: 'channel token required' });
-        const row = await this.loadChannelRow(body.token);
+        if (!body?.token || typeof body.token !== 'string') return res.status(400).json({ error: 'channel token required' });
+        const row = channelPermitted(ctx, { token: body.token }, [Permission.ReadCatalog]) ? await this.loadChannelRow(body.token) : null;
         if (!row) return res.status(404).json({ error: 'channel not found' });
         const cfg = this.buildConfig(body.token, row);
         const verdict = isAllowed(body.country || null, body.region || null, {
@@ -874,9 +885,13 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
     async gc(@Ctx() ctx: RequestContext, @Body() body: any, @Res() res: Response) {
         if (!requireAdmin(ctx, res, true)) return;
         const olderThanDays = Math.max(1, parseInt(body?.olderThanDays || '90', 10) || 90);
+        // A channel administrator prunes only its own channels' audit rows.
+        const scope = isSuperAdmin(ctx) ? null : permittedChannelIds(ctx, [Permission.UpdateCatalog]);
+        if (scope && !scope.length) return res.json({ deleted: 0, olderThanDays });
         const result = await adapterFor(this.connection.rawConnection).query(
-            `DELETE FROM geo_block_event WHERE \`createdAt\` < DATE_SUB(NOW(), INTERVAL ? DAY)`,
-            [olderThanDays],
+            `DELETE FROM geo_block_event WHERE \`createdAt\` < DATE_SUB(NOW(), INTERVAL ? DAY)`
+                + (scope ? ` AND \`channelId\` IN (${scope.map(() => '?').join(', ')})` : ''),
+            scope ? [olderThanDays, ...scope] : [olderThanDays],
             { needAffected: true },
         );
         return res.json({ deleted: result?.affectedRows ?? 0, olderThanDays });
@@ -912,9 +927,10 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
      * available as JSON via `Accept: application/json`, for storefronts
      * that want to render their own UI but still lift the copy.
      *
-     * Accepts `t` (channel token), `reason`, `country`, and optional
-     * `msg` (operator-provided). Every value is HTML-escaped before it
-     * lands in the template.
+     * Accepts `t` (channel token), `reason` and `country`. The message is
+     * the channel's own (block message / schedule message / default for the
+     * reason) — never text from the URL, which anyone could craft into a
+     * store-branded phishing page. Every value is HTML-escaped.
      */
     @Get('blocked')
     async blocked(@Req() req: Request, @Res() res: Response) {
@@ -928,12 +944,16 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
 
         let logoUrl: string | null = null;
         let redirectUrl: string | null = null;
-        let msg: string = String((req.query as any).msg || '').slice(0, 400);
+        let msg = '';
         if (token) {
             const row = await this.loadChannelRow(token);
             if (row) {
                 logoUrl = row.blockLogoUrl || null;
                 redirectUrl = row.blockRedirectUrl || null;
+                if (reason === 'schedule') {
+                    const sched = parseJsonSafely<BusinessHoursSchedule>(row.schedule);
+                    msg = String(sched?.outsideMessage || checkSchedule(sched).message || '').slice(0, 400);
+                }
                 if (!msg && row.blockMessage) msg = String(row.blockMessage).slice(0, 400);
             }
         }
@@ -970,11 +990,29 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
         return row;
     }
 
+    /** `companyData` comes from Channel custom fields the HOST may define
+     *  (`showCompanyNumber`, `businessCompanyNumber`); this plugin does not
+     *  register them, so they are only selected when they exist — selecting
+     *  them unconditionally made every per-channel call fail elsewhere. */
+    private companyCols: string | null = null;
+    private companyColumns(): string {
+        if (this.companyCols !== null) return this.companyCols;
+        let cols = '';
+        try {
+            const meta = this.connection.rawConnection.getMetadata(Channel);
+            const show = meta.findColumnWithPropertyPath('customFields.showCompanyNumber');
+            const num = meta.findColumnWithPropertyPath('customFields.businessCompanyNumber');
+            if (show) cols += `\`${show.databaseName}\` AS showCompanyNumber,\n`;
+            if (num) cols += `\`${num.databaseName}\` AS companyNumber,\n`;
+        } catch { cols = ''; }
+        this.companyCols = cols;
+        return cols;
+    }
+
     private async loadChannelRowUncached(token: string): Promise<any | null> {
         const rows = await adapterFor(this.connection.rawConnection).query(
             `SELECT id, token,
-                    \`customFieldsShowcompanynumber\`           AS showCompanyNumber,
-                    \`customFieldsBusinesscompanynumber\`       AS companyNumber,
+                    ${this.companyColumns()}
                     \`customFieldsGeoblockenabled\`             AS geoBlockEnabled,
                     \`customFieldsGeoblockmode\`                AS geoBlockMode,
                     \`customFieldsGeoblockallowedregions\`      AS allowedRegions,

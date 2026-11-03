@@ -22,7 +22,8 @@ describe('getRealIp', () => {
         expect(getRealIp(req({ 'x-forwarded-for': '198.51.100.1, 10.0.0.9', 'cf-connecting-ip': '198.51.100.2' }))).toBe('10.0.0.9');
     });
     it('honours only the headers the host trusts, in order', () => {
-        expect(getRealIp(req({ 'x-forwarded-for': '198.51.100.1, 10.0.0.9' }), ['x-forwarded-for'])).toBe('198.51.100.1');
+        // Right-most hop: the left-most one is whatever the client sent.
+        expect(getRealIp(req({ 'x-forwarded-for': '198.51.100.1, 198.51.100.3' }), ['x-forwarded-for'])).toBe('198.51.100.3');
         expect(getRealIp(req({ 'cf-connecting-ip': '::ffff:198.51.100.2' }), ['cf-connecting-ip'])).toBe('198.51.100.2');
         expect(getRealIp(req({}), ['cf-connecting-ip'])).toBe('10.0.0.9');
         expect(normaliseIp('')).toBeNull();

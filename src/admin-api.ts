@@ -21,8 +21,10 @@ import {
     FREE_TIER_PRESET_KEYS,
     isAllowed,
     REGION_PRESETS,
+    resolveAllowedCountries,
 } from './geo-regions';
 import { GeoBlockPlugin } from './plugin';
+import { channelPermitted } from './channel-access';
 
 export const geoBlockAdminApiSchema = gql`
     type GeoBlockPreset {
@@ -155,7 +157,7 @@ export class GeoBlockAdminResolver {
              FROM channel`,
             [],
         );
-        return rows.map((r: any) => ({
+        return rows.filter((r: any) => channelPermitted(ctx, { id: r.channelId }, [Permission.ReadCatalog])).map((r: any) => ({
             channelId: Number(r.channelId),
             channelToken: String(r.channelToken),
             channelName: r.channelName || null,
@@ -181,6 +183,7 @@ export class GeoBlockAdminResolver {
         if (!GeoBlockPlugin.hasPremiumAccess()) {
             throw new Error(premiumFeatureError('vendure-plugin-geo-block').message);
         }
+        if (!channelPermitted(ctx, { id: channelId }, [Permission.ReadCatalog])) throw new Error('channel not found');
         const days = Math.min(Math.max(Number(daysInput) || 30, 1), 365);
         const where = `\`channelId\` = ? AND \`createdAt\` >= DATE_SUB(NOW(), INTERVAL ? DAY)`;
         const params = [channelId, days];
@@ -221,6 +224,8 @@ export class GeoBlockAdminResolver {
     @Allow(Permission.UpdateCatalog)
     async geoBlockSaveChannel(@Ctx() ctx: RequestContext, @Args('input') input: any): Promise<any> {
         if (!input?.channelToken) throw new Error('channelToken required');
+        // The input names the channel: require UpdateCatalog in THAT channel.
+        if (!channelPermitted(ctx, { token: String(input.channelToken) }, [Permission.UpdateCatalog])) throw new Error('channel not found');
         const set: string[] = [];
         const params: any[] = [];
         // Same columns and JSON-array storage as the REST save route (the two used to disagree).
@@ -240,24 +245,26 @@ export class GeoBlockAdminResolver {
         push('customFieldsGeoblockipallowlist', input.ipAllowlist);
         if (!set.length) throw new Error('no fields to update');
         params.push(input.channelToken);
-        const result = await adapterFor(this.connection.rawConnection).query(
+        const exists = await adapterFor(this.connection.rawConnection).query('SELECT id FROM channel WHERE token = ?', [input.channelToken]);
+        if (!(exists as any[]).length) throw new Error('channel not found');
+        await adapterFor(this.connection.rawConnection).query(
             `UPDATE channel SET ${set.join(', ')} WHERE token = ?`,
             params,
-            { needAffected: true },
         );
-        if (!(result as any).affectedRows) throw new Error('channel not found');
         const rows = await this.geoBlockChannels(ctx);
         return rows.find((r: any) => r.channelToken === input.channelToken);
     }
 
     @Mutation()
     @Allow(Permission.ReadCatalog)
-    async geoBlockSimulate(@Args('input') input: any): Promise<any> {
+    async geoBlockSimulate(@Ctx() ctx: RequestContext, @Args('input') input: any): Promise<any> {
         if (!GeoBlockPlugin.hasPremiumAccess()) {
             throw new Error(premiumFeatureError('vendure-plugin-geo-block').message);
         }
+        if (!channelPermitted(ctx, { token: String(input?.channelToken || '') }, [Permission.ReadCatalog])) throw new Error('channel not found');
         const rows = await adapterFor(this.connection.rawConnection).query(
             `SELECT \`customFieldsGeoblockenabled\`          AS enabled,
+                    \`customFieldsGeoblockallowedregions\`   AS allowedRegions,
                     \`customFieldsGeoblockallowedcountries\` AS allowedCountries,
                     \`customFieldsGeoblockblockedcountries\` AS blockedCountries,
                     \`customFieldsGeoblockallowedgbregions\` AS allowedGbRegions,
@@ -267,10 +274,16 @@ export class GeoBlockAdminResolver {
         );
         const r = (rows as any[])[0];
         if (!r) throw new Error('channel not found');
+        // Same resolution as /check and the REST simulator: presets + extra − blocked.
+        const resolved = resolveAllowedCountries({
+            regions: splitList(r.allowedRegions),
+            extraAllowed: splitList(r.allowedCountries),
+            blocked: splitList(r.blockedCountries),
+        });
         const verdict = isAllowed(input.country || null, input.region || null, {
-            enabled: !!r.enabled,
-            allowedCountries: splitList(r.allowedCountries),
-            blockedCountries: splitList(r.blockedCountries),
+            enabled: !!Number(r.enabled || 0),
+            allowedCountries: resolved.allowed,
+            blockedCountries: resolved.blocked,
             allowedGbRegions: splitList(r.allowedGbRegions),
             allowedSubdivisions: {},
         });
@@ -278,7 +291,17 @@ export class GeoBlockAdminResolver {
     }
 }
 
-function splitList(raw: string | null | undefined): string[] {
+/** List columns are stored as JSON arrays (by both save routes and by
+ *  Vendure's own list custom fields); older rows may be comma-separated. */
+function splitList(raw: any): string[] {
     if (!raw) return [];
-    return String(raw).split(',').map(s => s.trim()).filter(Boolean);
+    if (Array.isArray(raw)) return raw.filter(v => typeof v === 'string');
+    const text = String(raw).trim();
+    if (text.startsWith('[')) {
+        try {
+            const parsed = JSON.parse(text);
+            if (Array.isArray(parsed)) return parsed.filter(v => typeof v === 'string');
+        } catch { /* fall through to CSV */ }
+    }
+    return text.split(',').map(s => s.trim()).filter(Boolean);
 }

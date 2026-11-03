@@ -4,6 +4,53 @@ All notable changes to `@huloglobal/vendure-plugin-geo-block` are documented
 here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and this project adheres to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.2] — 2026-11-03
+
+Security and reliability review.
+
+### Security
+- **Country headers are no longer believed from any client.** `CF-IPCountry`,
+  `cf-region-code`, `X-Akamai-Edgescape` and `X-Country-Code` are read only
+  when the request reached Vendure through a proxy trusted by Express
+  `trust proxy` (Vendure `apiOptions.trustProxy`). New option
+  `trustedCountryHeaders` names exactly which headers to trust instead (set it
+  to your edge's header, e.g. `['x-country-code']` behind Fastly, so a client
+  cannot outrank it with its own `CF-IPCountry`; `[]` ignores them all). When
+  Cloudflare reports `XX`/`T1` the country is unknown — a client-added
+  `X-Country-Code` no longer fills the gap. **Behaviour change:** a host that
+  sits behind a proxy without setting `trustProxy` must set it (or
+  `trustedCountryHeaders`) for country rules to apply.
+- `trustedIpHeaders: ['x-forwarded-for']` now takes the right-most hop that is
+  not a trusted proxy, not the client-written left-most one (which let anyone
+  claim an allow-listed office IP).
+- **Admin routes are channel-scoped.** The REST routes (`admin/channels`,
+  `admin/save`, `admin/simulate`, `admin/stats`, `admin/gc`) and the GraphQL
+  `geoBlockChannels`, `geoBlockSaveChannel`, `geoBlockSimulate`,
+  `geoBlockStats` checked the permission only in the request's own channel,
+  then acted on whichever channel the body named — an administrator of one
+  channel could read every channel's token and IP allowlist and rewrite (or
+  switch off) another channel's rules. They now require the permission in the
+  channel acted on, and lists show only those channels.
+- `/geo-block/blocked` ignores `?msg=`: the message is the channel's own block
+  message, schedule message or the default for the reason. Before, anyone
+  could craft a link rendering arbitrary text under the store's logo.
+
+### Fixed
+- `/check`, `/site-config` (with a channel token), `/blocked` and the
+  simulator failed with an SQL error on every host that does not itself define
+  the Channel custom fields `showCompanyNumber` / `businessCompanyNumber`, so
+  the storefront helper failed open and nothing was ever blocked. Those
+  columns are now selected only when the host defines them (`companyData`
+  stays as before where they exist).
+- GraphQL `geoBlockChannels` / `geoBlockSimulate` read the JSON-stored lists
+  as comma-separated text (`["GB"` / `"FR"]`), so the simulator gave wrong
+  verdicts and ignored region presets; they now resolve the rules exactly as
+  `/check` does.
+- The save routes answered "channel not found" on SQLite although the update
+  had been applied.
+- E2E runs point the licence SDK at a local stub instead of the live licence
+  server.
+
 ## [0.14.1] — 2026-10-28
 
 ### Changed

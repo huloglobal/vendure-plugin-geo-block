@@ -77,6 +77,12 @@ Add `GeoBlockPlugin.uiExtensions` to your `compileUiExtensions` config.
 > **Visitor IP:** the plugin uses Express's `req.ip` (set `trustProxy` on the
 > Vendure host). Only list headers your edge sets and strips from clients in
 > `trustedIpHeaders`, e.g. `['cf-connecting-ip']` behind Cloudflare.
+> **Visitor country:** `CF-IPCountry` / `cf-region-code`, Akamai
+> `X-Akamai-Edgescape` and Fastly `X-Country-Code` are believed only when the
+> request came through a proxy trusted by `trustProxy`. Behind anything other
+> than Cloudflare, set `trustedCountryHeaders` to your edge's one header (e.g.
+> `['x-country-code']`) so a visitor cannot send a `CF-IPCountry` of their own.
+> A visitor whose country cannot be resolved is allowed (fail-open).
 > Audit rows are pruned after 90 days / 500 000 rows by default
 > (`retention: false` keeps everything).
 
@@ -151,13 +157,19 @@ back to sensible defaults per block reason.
 
 ### Proxy-aware
 
-Reads `cf-ipcountry` / Akamai / Fastly region headers when present.
-Saves a MaxMind lookup per request.
+Reads `cf-ipcountry` / Akamai / Fastly region headers from a trusted
+proxy (see *Visitor country* above). Saves a MaxMind lookup per request.
 
 ### Security
 
-- `signingSecret` HMAC-gates the `?country=` override on `/check` so
-  storefront staff (or attackers) can't spoof a location at will.
+- `signingSecret` HMAC-gates the `?country=` / `?region=` override on
+  `/check`. Without it the override is the caller's own claim: anyone can ask
+  `/check?country=GB` and get "allowed". That is harmless while the verdict is
+  only used by the visitor's own browser (the storefront helper never
+  forwards it), but set `signingSecret` before any server-side integration
+  passes a visitor's query string to `/check`.
+- Admin routes act only on channels where the administrator holds the
+  permission (lists show only those channels).
 - Audit IPs are SHA-256 hashed by default with `ipSalt`; when it is unset a
   random per-install salt is generated once and kept in `hulo_licence_store`
   (key `vendure-plugin-geo-block:ipsalt`), shared by server and worker. Set

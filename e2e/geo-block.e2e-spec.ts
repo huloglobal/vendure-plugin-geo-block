@@ -1,3 +1,4 @@
+import './local-licence-env'; // keep test runs off the live licence server
 import { mergeConfig } from '@vendure/core';
 import { createTestEnvironment, registerInitializer, SqljsInitializer, testConfig } from '@vendure/testing';
 import * as path from 'path';

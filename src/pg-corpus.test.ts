@@ -84,6 +84,8 @@ function standIn(expr: string): string {
     if (/^(where|w|whereClause)$/.test(e)) return '`createdAt` >= DATE_SUB(NOW(), INTERVAL ? DAY) AND `channelId` = ?';
     if (/set\.join/.test(e)) return '`customFieldsGeoblockenabled` = ?, `customFieldsGeoblockmode` = ?';
     if (/channelId/.test(e)) return ' AND `channelId` = ?';
+    if (/companyColumns\(\)/.test(e)) return '`customFieldsShowcompanynumber` AS showCompanyNumber, `customFieldsBusinesscompanynumber` AS companyNumber,';
+    if (/scope\.map/.test(e)) return '?';
     throw new Error(`pg-corpus: no stand-in for interpolation \${${e}} — add one to standIn()`);
 }
 
