@@ -139,7 +139,7 @@ Follow-up to the 0.13.2 hardening pass.
 
 Reliability and security pass — no new features.
 
-### Fixed
+### Security
 - **Client IP could be forged.** `/check` and the rate limiter trusted
   `X-Forwarded-For`, `CF-Connecting-IP`, `True-Client-IP` and `X-Real-IP`
   from any client, so anyone could send an allow-listed office address
@@ -148,6 +148,15 @@ Reliability and security pass — no new features.
   read when listed in the new `trustedIpHeaders` option. IPv4-mapped IPv6
   addresses (`::ffff:…`) now match IPv4 allowlist entries; matching is
   case-insensitive.
+- `?country=`/`?region=` overrides must be plain ISO codes and, when a
+  `signingSecret` is set, both must be signed (`regionSig`).
+- Self-update and licence activate/deactivate/purchase/portal require
+  SuperAdmin; `admin/stats` authenticates before revealing the tier.
+- Save validation: bounded lists, ISO country codes, known preset keys,
+  parseable IPs/CIDRs (prefix ≥ 8), http(s)-only redirect and logo URLs;
+  rejected values are returned in the response.
+
+### Fixed
 - **Storefront helper blocked cross-origin.** `hulo-geo.js` carried
   `Cross-Origin-Resource-Policy: same-origin`, so a storefront on a
   different origin than the API could not load it. It is now
@@ -159,18 +168,11 @@ Reliability and security pass — no new features.
   (`customFields_huloGeoBlock…`); `geoBlockChannels`, `geoBlockSaveChannel`
   and `geoBlockSimulate` now use the real columns and the same JSON-array
   storage as the REST routes.
-- `?country=`/`?region=` overrides must be plain ISO codes and, when a
-  `signingSecret` is set, both must be signed (`regionSig`).
 - `maintenanceWindow.allowedIps` is honoured; the simulator applies
   subdivisions and reports schedule, bot and maintenance verdicts like
   enforcement does.
 - Schedules typed with day numbers as strings no longer block every day;
   the midnight hour can no longer render as `24:xx` (fail-open).
-- Self-update and licence activate/deactivate/purchase/portal require
-  SuperAdmin; `admin/stats` authenticates before revealing the tier.
-- Save validation: bounded lists, ISO country codes, known preset keys,
-  parseable IPs/CIDRs (prefix ≥ 8), http(s)-only redirect and logo URLs;
-  rejected values are returned in the response.
 
 ### Changed
 - Audit rows are written with `insert` after the response (no longer
