@@ -223,7 +223,7 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
     }
 
 
-    private licenceStore = new LicenceStore((sql: string, params?: any[]) => adapterFor(this.connection.rawConnection).query(sql, params));
+    private licenceStore = new LicenceStore((sql, params, opts) => adapterFor(this.connection.rawConnection).query(sql, params, opts));
 
     /** Licence/evaluation state for the admin banner. */
     @Get('licence/status')

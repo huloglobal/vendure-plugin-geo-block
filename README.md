@@ -1,4 +1,4 @@
-<p align="center"><a href="https://huloglobal.com/vendure-plugins/geo-block/"><img src="https://huloglobal.com/vendure-plugins/logos/geo-block.svg" width="96" height="96" alt="HULO Geo-block logo"></a></p>
+<p align="center"><a href="https://huloglobal.com/vendure-plugins/geo-block/"><img src="https://huloglobal.com/vendure-plugins/logos/geo-block.svg?v=2" width="96" height="96" alt="HULO Geo-block logo"></a></p>
 
 # @huloglobal/vendure-plugin-geo-block
 

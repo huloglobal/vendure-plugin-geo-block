@@ -1,10 +1,10 @@
 {
   "name": "@huloglobal/vendure-plugin-geo-block",
-  "version": "0.14.3",
-  "description": "Geo-restrict your Vendure storefront by country, UK region or curated region presets (EU, EEA, British Isles, Europe, North America, Oceania, Worldwide-with-denylist). Per-channel settings exposed as Channel custom fields plus a dedicated admin page with a live preview of the resolved allow-list.",
+  "version": "0.14.4",
+  "description": "Per-channel geo-restriction for Vendure storefronts: allow or block by country, region preset, state or province, with a soft-block mode, IP allowlist, search-bot allowlist, business-hours schedule, maintenance windows and a branded block page.",
   "license": "AGPL-3.0-or-later",
   "author": "Wayne Garrison <wayne@garrison.me.uk>",
-  "homepage": "https://github.com/huloglobal/vendure-plugin-geo-block",
+  "homepage": "https://huloglobal.com/vendure-plugins/geo-block/",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/huloglobal/vendure-plugin-geo-block.git"
@@ -30,7 +30,7 @@
   },
   "dependencies": {
     "graphql-tag": "^2.12.7",
-    "@huloglobal/vendure-licence-sdk": "^0.15.1"
+    "@huloglobal/vendure-licence-sdk": "^0.15.4"
   },
   "peerDependencies": {
     "@nestjs/common": ">=10.0.0",
@@ -44,7 +44,7 @@
     }
   },
   "devDependencies": {
-    "@huloglobal/vendure-licence-sdk": "^0.15.1",
+    "@huloglobal/vendure-licence-sdk": "^0.15.4",
     "@nestjs/common": "^10.0.0",
     "@vendure/core": "^3.7.3",
     "nodemailer": "^6.9.0",
@@ -55,7 +55,11 @@
     "vendure",
     "vendure-plugin",
     "geo-block",
+    "geo-blocking",
     "geo-restriction",
-    "geoip"
+    "geoip",
+    "country-blocking",
+    "ip-allowlist",
+    "maintenance-mode"
   ]
 }
