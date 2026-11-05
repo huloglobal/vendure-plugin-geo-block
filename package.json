@@ -1,8 +1,8 @@
 {
   "name": "@huloglobal/vendure-plugin-geo-block",
-  "version": "0.14.4",
+  "version": "0.14.5",
   "description": "Per-channel geo-restriction for Vendure storefronts: allow or block by country, region preset, state or province, with a soft-block mode, IP allowlist, search-bot allowlist, business-hours schedule, maintenance windows and a branded block page.",
-  "license": "AGPL-3.0-or-later",
+  "license": "AGPL-3.0-only",
   "author": "Wayne Garrison <wayne@garrison.me.uk>",
   "homepage": "https://huloglobal.com/vendure-plugins/geo-block/",
   "repository": {
