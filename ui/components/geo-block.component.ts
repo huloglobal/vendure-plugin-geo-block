@@ -18,8 +18,15 @@ interface ChannelRow {
     blockMessage: string;
     blockRedirectUrl: string;
     blockLogoUrl: string;
+    schedule: ScheduleForm | null;
+    maintenance: MaintenanceForm | null;
+    maintenanceActive?: boolean;
+    enforcePurchases: boolean;
     resolved: { allowedCountries: string[] | null; blockedCountries: string[] };
 }
+
+interface ScheduleForm { timezone?: string; days?: number[]; from?: string; to?: string; outsideAction?: 'block' | 'soft' | 'allow'; outsideMessage?: string; }
+interface MaintenanceForm { startsAt: string; endsAt: string; allowedIps?: string[]; message?: string; }
 
 interface SubdivisionDef { code: string; label: string; }
 
@@ -167,7 +174,7 @@ interface PresetMeta { key: string; label: string; kind: string; description: st
         <!-- Set-up checklist — real checks from GET /geo-block/setup.
              Hidden once everything is done, or after "Hide" until an
              item that was done comes undone again. -->
-        <vdr-page-block *ngIf="setup && setupVisible()">
+        <vdr-page-block *ngIf="setup && setup.premium !== false && setupVisible()">
             <div class="card setup-card">
                 <div class="card-block">
                     <div class="setup-head">
@@ -191,7 +198,7 @@ interface PresetMeta { key: string; label: string; kind: string; description: st
             <div class="card">
                 <div class="card-block">
                     <div class="digest-head">
-                        <h3 class="step-title">Weekly report <small>Mondays 08:00, server time</small></h3>
+                        <h3 class="step-title">Weekly report <small>Mondays 08:00, server time</small> <span class="unlock-chip" *ngIf="digest.premium === false">🔒 Premium</span></h3>
                         <span class="gb-switch-group">
                             <button class="gb-switch" role="switch" [attr.aria-checked]="digest.enabled" [class.on]="digest.enabled" (click)="toggleDigest()" [disabled]="digestSaving" aria-label="Weekly report">
                                 <span class="gb-switch-knob" aria-hidden="true"></span>
@@ -207,7 +214,7 @@ interface PresetMeta { key: string; label: string; kind: string; description: st
                         <button class="gbtn gbtn-outline gbtn-sm" (click)="previewDigest()" [disabled]="digestPreviewing">{{ digestPreviewing ? 'Opening…' : 'Preview' }}</button>
                     </div>
                     <p class="hint" style="margin:8px 0 0">
-                        Last sent {{ digest.lastSentAt ? (digest.lastSentAt | date:'d MMM y, HH:mm') : 'never' }} · next {{ digest.nextDueAt ? (digest.nextDueAt | date:'d MMM y, HH:mm') : '—' }}<span *ngIf="!digest.recipient && !digest.defaultRecipient"> · no recipient yet — enter one above</span>
+                        <span *ngIf="digest.premium === false">The weekly report is a premium feature: nothing is sent on the free tier (your settings are kept). Start the evaluation or activate a licence above. · </span>Last sent {{ digest.lastSentAt ? (digest.lastSentAt | date:'d MMM y, HH:mm') : 'never' }} · next {{ digest.nextDueAt ? (digest.nextDueAt | date:'d MMM y, HH:mm') : '—' }}<span *ngIf="!digest.recipient && !digest.defaultRecipient"> · no recipient yet — enter one above</span>
                     </p>
                 </div>
             </div>
@@ -263,8 +270,11 @@ interface PresetMeta { key: string; label: string; kind: string; description: st
                         <button class="tab" role="tab" [attr.aria-selected]="tab === 'rules'" [class.active]="tab === 'rules'" (click)="tab = 'rules'">Rules</button>
                         <button class="tab" role="tab" [attr.aria-selected]="tab === 'message'" [class.active]="tab === 'message'" (click)="tab = 'message'">Block page</button>
                         <button class="tab" role="tab" [attr.aria-selected]="tab === 'allowlist'" [class.active]="tab === 'allowlist'" (click)="tab = 'allowlist'">IP allowlist<span class="tab-count" *ngIf="current.ipAllowlist.length">{{ current.ipAllowlist.length }}</span></button>
+                        <button class="tab" role="tab" [attr.aria-selected]="tab === 'hours'" [class.active]="tab === 'hours'" (click)="tab = 'hours'; ensureScheduleForm()">Business hours</button>
+                        <button class="tab" role="tab" [attr.aria-selected]="tab === 'maintenance'" [class.active]="tab === 'maintenance'" (click)="tab = 'maintenance'; ensureMaintenanceForm()">Maintenance<span class="tab-count" *ngIf="current.maintenanceActive">on</span></button>
                         <button class="tab" role="tab" [attr.aria-selected]="tab === 'simulate'" [class.active]="tab === 'simulate'" (click)="tab = 'simulate'">Simulate</button>
                         <button class="tab" role="tab" [attr.aria-selected]="tab === 'stats'" [class.active]="tab === 'stats'" (click)="tab = 'stats'; loadStats()">Stats</button>
+                        <button class="tab" role="tab" [attr.aria-selected]="tab === 'settings'" [class.active]="tab === 'settings'" (click)="tab = 'settings'; loadSettings(); loadDiagnostic()">Settings</button>
                     </div>
                 </div>
             </div>
@@ -284,10 +294,27 @@ interface PresetMeta { key: string; label: string; kind: string; description: st
                             </label>
                             <label class="mode-card" [class.active]="current.mode === 'soft'">
                                 <input type="radio" name="bmode" value="soft" [(ngModel)]="current.mode" (ngModelChange)="markDirty()">
-                                <div class="mode-title">Soft block (browse-only)</div>
-                                <div class="mode-body">Visitors can browse but a banner explains you don't ship to their country and checkout is hidden.</div>
+                                <div class="mode-title">Soft block (banner) <span class="unlock-chip" *ngIf="!isPremium()">🔒 Premium</span></div>
+                                <div class="mode-body">Visitors can browse and see a banner saying you don't ship to their country. It is a banner only: purchases are not refused. On the free tier a soft block acts as a full block.</div>
                             </label>
                         </div>
+                    </div>
+                </div>
+            </vdr-page-block>
+
+            <vdr-page-block>
+                <div class="card">
+                    <div class="card-block">
+                        <div class="digest-head">
+                            <h3 class="step-title">Refuse purchases from blocked visitors <small>server-side, optional</small></h3>
+                            <span class="gb-switch-group">
+                                <button class="gb-switch" role="switch" [attr.aria-checked]="current.enforcePurchases" [class.on]="current.enforcePurchases" (click)="current.enforcePurchases = !current.enforcePurchases; markDirty()" aria-label="Refuse purchases from blocked visitors">
+                                    <span class="gb-switch-knob" aria-hidden="true"></span>
+                                </button>
+                                <span class="gb-switch-label">{{ current.enforcePurchases ? 'On' : 'Off' }}</span>
+                            </span>
+                        </div>
+                        <p class="hint">The block page is shown by your storefront; a visitor who skips it could still call the Shop API. With this on, Vendure itself refuses adding to the basket and checkout for visitors the rules fully block (business hours and maintenance included). A soft block stays a banner. It fails open: when the country is unknown, or anything goes wrong, the purchase goes ahead. Your IP allowlist still applies; search-engine crawlers get no exemption for purchases.</p>
                     </div>
                 </div>
             </vdr-page-block>
@@ -488,7 +515,7 @@ interface PresetMeta { key: string; label: string; kind: string; description: st
                 <div class="card">
                     <div class="card-block">
                         <h3 class="step-title">IP allowlist <small>(overrides every rule)</small></h3>
-                        <p class="hint">IPs or IPv4 CIDR ranges that bypass all country / region rules. Use for your office, oncall engineers, payment processor probes.</p>
+                        <p class="hint">IPs or CIDR ranges (IPv4 or IPv6, /8 or narrower) that bypass all country / region rules, business hours and maintenance. Use for your office, oncall engineers, payment processor probes.</p>
                         <div class="chip-row">
                             <span class="chip mono" *ngFor="let ip of current.ipAllowlist">
                                 {{ ip }}
@@ -497,9 +524,171 @@ interface PresetMeta { key: string; label: string; kind: string; description: st
                             <span *ngIf="!current.ipAllowlist.length" class="hint inline">No bypass IPs configured.</span>
                         </div>
                         <div class="picker">
-                            <input class="form-input mono" placeholder="203.0.113.42 or 203.0.113.0/24" [(ngModel)]="newIp" (keyup.enter)="addIp()" style="min-width: 260px">
+                            <input class="form-input mono" placeholder="203.0.113.42, 203.0.113.0/24 or 2001:db8::/48" [(ngModel)]="newIp" (keyup.enter)="addIp()" style="min-width: 260px">
                             <button class="gbtn gbtn-outline gbtn-sm" (click)="addIp()" [disabled]="!newIp">+ Add</button>
+                            <button class="gbtn gbtn-outline gbtn-sm" (click)="addMyIp()" [disabled]="addingMyIp" title="Adds the address this server sees for you, and saves it straight away">{{ addingMyIp ? 'Adding…' : 'Add my IP' }}</button>
                         </div>
+                    </div>
+                </div>
+            </vdr-page-block>
+        </ng-container>
+
+        <!-- ============================================================= BUSINESS HOURS TAB -->
+        <ng-container *ngIf="!loading && current && tab === 'hours' && scheduleForm">
+            <vdr-page-block>
+                <div class="card">
+                    <div class="card-block">
+                        <div class="digest-head">
+                            <h3 class="step-title">Business hours <small>(optional)</small></h3>
+                            <span class="gb-switch-group">
+                                <button class="gb-switch" role="switch" [attr.aria-checked]="scheduleOn" [class.on]="scheduleOn" (click)="scheduleOn = !scheduleOn; markDirty()" aria-label="Business hours">
+                                    <span class="gb-switch-knob" aria-hidden="true"></span>
+                                </button>
+                                <span class="gb-switch-label">{{ scheduleOn ? 'On' : 'Off' }}</span>
+                            </span>
+                        </div>
+                        <p class="hint">Open for orders only on the days and hours below; outside them every visitor (except your IP allowlist and search crawlers) gets the action you choose. Works even when country rules are off.</p>
+                        <ng-container *ngIf="scheduleOn">
+                            <div class="form-row">
+                                <label>Open on</label>
+                                <div class="chip-row">
+                                    <label class="chip" *ngFor="let d of weekdays" style="cursor:pointer">
+                                        <input type="checkbox" [checked]="scheduleForm.days?.includes(d.n)" (change)="toggleDay(d.n)"> {{ d.label }}
+                                    </label>
+                                </div>
+                                <p class="hint">No day ticked = every day.</p>
+                            </div>
+                            <div class="sim-grid">
+                                <div><label>Opens</label><input class="form-input" type="time" [(ngModel)]="scheduleForm.from" (ngModelChange)="markDirty()"></div>
+                                <div><label>Closes</label><input class="form-input" type="time" [(ngModel)]="scheduleForm.to" (ngModelChange)="markDirty()"></div>
+                                <div><label>Time zone</label><input class="form-input" [(ngModel)]="scheduleForm.timezone" (ngModelChange)="markDirty()" placeholder="Europe/London" list="gb-timezones"></div>
+                            </div>
+                            <datalist id="gb-timezones"><option *ngFor="let z of timezones" [value]="z"></option></datalist>
+                            <p class="hint">Closing before opening (e.g. 22:00 → 06:00) is an overnight window. Leave both empty for whole days.</p>
+                            <div class="form-row">
+                                <label>Outside these hours</label>
+                                <select class="form-select" [(ngModel)]="scheduleForm.outsideAction" (ngModelChange)="markDirty()">
+                                    <option value="block">Full block (closed page)</option>
+                                    <option value="soft">Soft block (banner){{ isPremium() ? '' : ' — premium; acts as a full block on the free tier' }}</option>
+                                    <option value="allow">Allow (schedule switched off)</option>
+                                </select>
+                            </div>
+                            <div class="form-row">
+                                <label>Message <small>(optional)</small></label>
+                                <textarea class="form-input" rows="2" [(ngModel)]="scheduleForm.outsideMessage" (ngModelChange)="markDirty()" placeholder="We're closed for orders right now. Please come back during business hours."></textarea>
+                            </div>
+                        </ng-container>
+                    </div>
+                </div>
+            </vdr-page-block>
+        </ng-container>
+
+        <!-- ============================================================= MAINTENANCE TAB -->
+        <ng-container *ngIf="!loading && current && tab === 'maintenance' && maintenanceForm">
+            <vdr-page-block>
+                <div class="card">
+                    <div class="card-block">
+                        <div class="digest-head">
+                            <h3 class="step-title">Maintenance window <small>this channel only</small></h3>
+                            <span class="gb-switch-group">
+                                <button class="gb-switch" role="switch" [attr.aria-checked]="maintenanceOn" [class.on]="maintenanceOn" (click)="maintenanceOn = !maintenanceOn; markDirty()" aria-label="Maintenance window">
+                                    <span class="gb-switch-knob" aria-hidden="true"></span>
+                                </button>
+                                <span class="gb-switch-label">{{ maintenanceOn ? 'Scheduled' : 'None' }}</span>
+                            </span>
+                        </div>
+                        <p class="hint">Between these times the storefront shows a "back soon" page (HTTP 503 with Retry-After, so search engines wait instead of de-indexing). Your IP allowlist, the addresses below and search crawlers still get in. At most 31 days.</p>
+                        <div class="lic-notice" *ngIf="current.maintenanceActive">Maintenance is in force right now.</div>
+                        <ng-container *ngIf="maintenanceOn">
+                            <div class="sim-grid">
+                                <div><label>Starts (your local time)</label><input class="form-input" type="datetime-local" [(ngModel)]="maintenanceForm.startsAt" (ngModelChange)="markDirty()"></div>
+                                <div><label>Ends (your local time)</label><input class="form-input" type="datetime-local" [(ngModel)]="maintenanceForm.endsAt" (ngModelChange)="markDirty()"></div>
+                            </div>
+                            <div class="form-row">
+                                <label>Also let in <small>(IPs or CIDRs, one per line)</small></label>
+                                <textarea class="form-input mono" rows="3" [(ngModel)]="maintenanceIpsText" (ngModelChange)="markDirty()" placeholder="203.0.113.10&#10;2001:db8::/48"></textarea>
+                            </div>
+                            <div class="form-row">
+                                <label>Message <small>(optional)</small></label>
+                                <textarea class="form-input" rows="2" [(ngModel)]="maintenanceForm.message" (ngModelChange)="markDirty()" placeholder="We're upgrading the store and will be back shortly."></textarea>
+                            </div>
+                        </ng-container>
+                    </div>
+                </div>
+            </vdr-page-block>
+        </ng-container>
+
+        <!-- ============================================================= SETTINGS TAB -->
+        <ng-container *ngIf="!loading && tab === 'settings'">
+            <vdr-page-block>
+                <div class="card">
+                    <div class="card-block">
+                        <h3 class="step-title">Where visitors' countries come from</h3>
+                        <p class="hint">What this server resolves for <strong>your</strong> request right now.</p>
+                        <div *ngIf="!diag" class="hint">Checking…</div>
+                        <div *ngIf="diag">
+                            <p>
+                                IP <code>{{ diag.ip || 'unknown' }}</code> · country <strong>{{ diag.country || 'unknown' }}{{ diag.region ? '-' + diag.region : '' }}</strong>
+                                · source <strong>{{ sourceLabel(diag.source) }}</strong>
+                                <span *ngIf="diag.crawlerExempt"> · treated as a search crawler</span>
+                            </p>
+                            <p class="hint">
+                                Through a trusted proxy: {{ diag.viaTrustedProxy ? 'yes' : 'no' }} ·
+                                country headers seen: {{ diag.countryHeadersPresent?.length ? diag.countryHeadersPresent.join(', ') : 'none' }} ·
+                                believed: {{ diag.countryHeadersTrusted?.length ? diag.countryHeadersTrusted.join(', ') : 'none' }}
+                                <span *ngIf="diag.cdnHeaderLastSeenAt"> · last CDN country {{ diag.cdnHeaderLastSeenAt | date:'d MMM, HH:mm' }}</span>
+                            </p>
+                            <p class="hint" *ngIf="diag.maxmind?.configured">
+                                Local MaxMind database {{ diag.maxmind.file }}: {{ diag.maxmind.loaded ? 'loaded' : 'not loaded' }}{{ diag.maxmind.databaseType ? ' (' + diag.maxmind.databaseType + ')' : '' }}{{ diag.maxmind.builtAt ? ', built ' + (diag.maxmind.builtAt | date:'d MMM y') : '' }}{{ diag.maxmind.error ? ' — ' + diag.maxmind.error : '' }}
+                            </p>
+                            <div class="lic-notice" *ngFor="let n of diag.notes">{{ n }}</div>
+                            <button class="gbtn gbtn-outline gbtn-sm" (click)="loadDiagnostic()">Check again</button>
+                        </div>
+                    </div>
+                </div>
+            </vdr-page-block>
+            <vdr-page-block>
+                <div class="card">
+                    <div class="card-block">
+                        <h3 class="step-title">Settings <small>all channels</small></h3>
+                        <p class="hint">Values from <code>GeoBlockPlugin.init()</code> are the defaults; what you change here overrides them (Reset returns to the init value). Changing settings needs the SuperAdmin permission.</p>
+                        <div *ngIf="!settings" class="hint">Loading…</div>
+                        <ng-container *ngIf="settings && settingsForm">
+                            <div class="form-row">
+                                <label>Search and social crawlers</label>
+                                <select class="form-select" [(ngModel)]="settingsForm.botMode">
+                                    <option value="strict">Let well-known crawlers through (recommended)</option>
+                                    <option value="permissive">Let anything that calls itself a bot through</option>
+                                    <option value="custom">Only the User-Agents listed below</option>
+                                    <option value="off">No crawler exemption</option>
+                                </select>
+                                <textarea *ngIf="settingsForm.botMode === 'custom'" class="form-input mono" rows="3" [(ngModel)]="settingsForm.botCustomText" placeholder="MyUptimeMonitor&#10;PartnerFeedBot"></textarea>
+                                <label class="chk"><input type="checkbox" [(ngModel)]="settingsForm.verifyBots"> Verify Googlebot and Bingbot by reverse DNS (a fake "Googlebot" is then treated as a normal visitor)</label>
+                            </div>
+                            <div class="sim-grid">
+                                <div><label>Rate limit <small>(requests/min per IP, public endpoints)</small></label><input class="form-input" type="number" min="10" max="10000" [(ngModel)]="settingsForm.rateLimitPerMinute"></div>
+                                <div><label>Storefront helper cache <small>(seconds)</small></label><input class="form-input" type="number" min="60" max="86400" [(ngModel)]="settingsForm.storefrontHelperMaxAgeSec"></div>
+                                <div><label>Support e-mail on the block page</label><input class="form-input" type="email" [(ngModel)]="settingsForm.supportEmail" placeholder="help@example.com"></div>
+                            </div>
+                            <label class="chk"><input type="checkbox" [(ngModel)]="settingsForm.hashAuditIps"> Store hashed (not raw) IPs in the audit log</label>
+                            <div style="display:flex; gap:8px; margin-top:12px; flex-wrap:wrap">
+                                <button class="gbtn gbtn-primary gbtn-sm" (click)="saveSettings()" [disabled]="settingsSaving">{{ settingsSaving ? 'Saving…' : 'Save settings' }}</button>
+                                <button class="gbtn gbtn-ghost gbtn-sm" (click)="resetSettings()" [disabled]="settingsSaving || !hasOverrides()">Reset to init options</button>
+                            </div>
+                            <h4 class="subsection-title" style="margin-top:20px">Set in code only <small>(security-relevant)</small></h4>
+                            <table class="table table-compact">
+                                <tbody>
+                                    <tr><td>Public base URL</td><td class="mono">{{ settings.readOnly.publicBaseUrl }}</td></tr>
+                                    <tr><td>Trusted IP headers</td><td class="mono">{{ settings.readOnly.trustedIpHeaders?.length ? settings.readOnly.trustedIpHeaders.join(', ') : 'none (Express req.ip)' }}</td></tr>
+                                    <tr><td>Trusted country headers</td><td class="mono">{{ isArr(settings.readOnly.trustedCountryHeaders) ? (settings.readOnly.trustedCountryHeaders.length ? settings.readOnly.trustedCountryHeaders.join(', ') : 'none') : settings.readOnly.trustedCountryHeaders }}</td></tr>
+                                    <tr><td>Local MaxMind database</td><td class="mono">{{ settings.readOnly.maxmindDb || 'not configured (maxmindDbPath)' }}</td></tr>
+                                    <tr><td>Signed ?country= override</td><td>{{ settings.readOnly.signingSecret ? 'signing secret set' : 'no signing secret' }}</td></tr>
+                                    <tr><td>Audit IP salt</td><td>{{ settings.readOnly.ipSalt ? 'set in code' : 'generated per install' }}</td></tr>
+                                    <tr><td>Audit log retention</td><td>{{ settings.readOnly.retention === 'off' ? 'keep everything' : settings.readOnly.retention.days + ' days / ' + (settings.readOnly.retention.maxRows | number) + ' rows' }}</td></tr>
+                                    <tr><td>Install-wide maintenance</td><td>{{ settings.readOnly.maintenanceWindow ? (settings.readOnly.maintenanceWindow.startsAt + ' → ' + settings.readOnly.maintenanceWindow.endsAt) : 'none' }}</td></tr>
+                                </tbody>
+                            </table>
+                        </ng-container>
                     </div>
                 </div>
             </vdr-page-block>
@@ -510,8 +699,12 @@ interface PresetMeta { key: string; label: string; kind: string; description: st
             <vdr-page-block>
                 <div class="card">
                     <div class="card-block">
-                        <h3 class="step-title">Simulate a visitor</h3>
-                        <p class="hint">Test exactly what your current rules will do for a hypothetical visitor — without saving anything to the storefront.</p>
+                        <h3 class="step-title">Simulate a visitor <span class="unlock-chip" *ngIf="!isPremium()">🔒 Premium</span></h3>
+                        <p class="hint">Test exactly what your saved rules will do for a hypothetical visitor — without changing anything on the storefront.</p>
+                        <div *ngIf="!isPremium()" class="unlock-box">
+                            <span class="unlock-chip">🔒 Premium</span>
+                            The simulator needs a licence — start the free evaluation or activate a key at the top of this page. Your rules are enforced either way.
+                        </div>
                         <div class="sim-grid">
                             <div>
                                 <label>Country code</label>
@@ -526,7 +719,7 @@ interface PresetMeta { key: string; label: string; kind: string; description: st
                                 <input class="form-input" [(ngModel)]="sim.ip" placeholder="203.0.113.42">
                             </div>
                         </div>
-                        <button class="gbtn gbtn-primary" (click)="runSim()" [disabled]="simBusy">
+                        <button class="gbtn gbtn-primary" (click)="runSim()" [disabled]="simBusy || !isPremium()">
                             {{ simBusy ? 'Running…' : 'Run simulation' }}
                         </button>
 
@@ -540,6 +733,10 @@ interface PresetMeta { key: string; label: string; kind: string; description: st
                             <div *ngIf="!simResult.ipMatchesAllowlist && !simResult.verdict.allowed" class="sim-banner deny">
                                 <strong>🚫 Blocked</strong> ({{ simResult.verdict.reason }})
                             </div>
+                            <p class="hint" *ngIf="simResult.decision">
+                                Right now, with business hours and maintenance: <strong>{{ simResult.decision.allowed ? 'allowed' : (simResult.decision.mode === 'soft' ? 'soft block (banner)' : 'blocked') }}</strong> ({{ simResult.decision.reason }}).
+                                Purchases: <strong>{{ simResult.purchase?.refused ? (simResult.purchase.enforced ? 'refused by the server' : 'would be refused if “Refuse purchases” were on') : 'allowed' }}</strong>.
+                            </p>
                         </div>
                     </div>
                 </div>
@@ -614,7 +811,7 @@ interface PresetMeta { key: string; label: string; kind: string; description: st
         </ng-container>
 
         <!-- ============================================================= SAVE BAR -->
-        <vdr-page-block *ngIf="!loading && current && tab !== 'simulate' && tab !== 'stats'">
+        <vdr-page-block *ngIf="!loading && current && tab !== 'simulate' && tab !== 'stats' && tab !== 'settings'">
             <div class="save-bar" [class.is-dirty]="dirty">
                 <span class="save-msg" *ngIf="dirty"><span class="save-dot" aria-hidden="true"></span> Unsaved changes</span>
                 <span class="save-msg quiet" *ngIf="!dirty">All changes saved</span>
@@ -639,6 +836,7 @@ interface PresetMeta { key: string; label: string; kind: string; description: st
         .lic-notice { margin-top:8px; padding:10px 14px; border-radius:8px; font-size:13px; line-height:1.5; background:#fffbeb; border:1px solid #fcd34d; color:#92400e; }
         .unlock-chip { display:inline-flex; align-items:center; gap:4px; font-size:11px; font-weight:700; padding:3px 9px; border-radius:999px; background:var(--gb-tint-warn, #fef3c7); border:1px solid var(--gb-line-warn, #fcd34d); color:var(--gb-strong); white-space:nowrap; }
         .unlock-box { display:flex; gap:10px; align-items:center; flex-wrap:wrap; padding:12px 14px; border-radius:8px; font-size:13px; color:var(--gb-strong); background:var(--gb-tint-warn); border:1px solid var(--gb-line-warn); }
+        .chk { display:flex; gap:8px; align-items:center; font-size:13px; margin-top:8px; font-weight:400; }
 
         :host { display: block; color: var(--gb-strong); }
 
@@ -1052,7 +1250,23 @@ export class GeoBlockComponent implements OnInit, OnDestroy {
     current: ChannelRow | null = null;
     dirty = false;
 
-    tab: 'rules' | 'message' | 'allowlist' | 'simulate' | 'stats' = 'rules';
+    tab: 'rules' | 'message' | 'allowlist' | 'hours' | 'maintenance' | 'simulate' | 'stats' | 'settings' = 'rules';
+
+    // Business hours / maintenance forms (per channel, saved with the channel)
+    scheduleForm: ScheduleForm | null = null;
+    scheduleOn = false;
+    maintenanceForm: MaintenanceForm | null = null;
+    maintenanceOn = false;
+    maintenanceIpsText = '';
+    weekdays = [{ n: 1, label: 'Mon' }, { n: 2, label: 'Tue' }, { n: 3, label: 'Wed' }, { n: 4, label: 'Thu' }, { n: 5, label: 'Fri' }, { n: 6, label: 'Sat' }, { n: 7, label: 'Sun' }];
+    timezones: string[] = (() => { try { return (Intl as any).supportedValuesOf('timeZone'); } catch { return ['UTC', 'Europe/London', 'Europe/Dublin', 'Europe/Paris', 'Europe/Berlin', 'America/New_York', 'America/Chicago', 'America/Los_Angeles', 'Australia/Sydney']; } })();
+    addingMyIp = false;
+
+    // Settings tab
+    settings: any = null;
+    settingsForm: any = null;
+    settingsSaving = false;
+    diag: any = null;
     strategy: 'specific' | 'worldwide' = 'specific';
     presetFilter = '';
 
@@ -1515,12 +1729,16 @@ export class GeoBlockComponent implements OnInit, OnDestroy {
                     blockMessage: c.blockMessage || '',
                     blockRedirectUrl: c.blockRedirectUrl || '',
                     blockLogoUrl: c.blockLogoUrl || '',
+                    schedule: c.schedule || null,
+                    maintenance: c.maintenance || null,
+                    enforcePurchases: !!c.enforcePurchases,
                 }));
                 if (!this.currentToken && this.channels.length) {
                     this.currentToken = this.channels[0].token;
                 }
                 this.current = this.channels.find(c => c.token === this.currentToken) || null;
                 this.deriveStrategy();
+                this.resetForms();
                 this.loading = false;
                 this.cdr.markForCheck();
             },
@@ -1535,6 +1753,7 @@ export class GeoBlockComponent implements OnInit, OnDestroy {
         this.current = this.channels.find(c => c.token === this.currentToken) || null;
         this.dirty = false;
         this.deriveStrategy();
+        this.resetForms();
         this.stats = null;
         this.statsLocked = false;
         this.simResult = null;
@@ -1738,12 +1957,33 @@ export class GeoBlockComponent implements OnInit, OnDestroy {
             blockMessage: this.current.blockMessage,
             blockRedirectUrl: this.current.blockRedirectUrl,
             blockLogoUrl: this.current.blockLogoUrl,
+            enforcePurchases: !!this.current.enforcePurchases,
         };
+        // Business hours / maintenance are only sent once their tab has been opened.
+        if (this.scheduleForm) {
+            (body as any).schedule = this.scheduleOn ? {
+                ...this.scheduleForm,
+                from: this.scheduleForm.from || undefined,
+                to: this.scheduleForm.to || undefined,
+            } : null;
+        }
+        if (this.maintenanceForm) {
+            const toIso = (local: string) => { const d = new Date(local); return isNaN(d.getTime()) ? '' : d.toISOString(); };
+            (body as any).maintenance = this.maintenanceOn ? {
+                startsAt: toIso(this.maintenanceForm.startsAt),
+                endsAt: toIso(this.maintenanceForm.endsAt),
+                allowedIps: this.maintenanceIpsText.split(/[\s,]+/).map(x => x.trim()).filter(Boolean),
+                message: this.maintenanceForm.message || '',
+            } : null;
+        }
         this.http.post<any>('/geo-block/admin/save', body).subscribe({
-            next: () => {
+            next: (r) => {
                 this.saving = false;
                 this.dirty = false;
-                this.notify.success('Site access settings saved');
+                if (r?.lockout) this.notify.error(r.message || 'Nothing would be allowed, so the rules were saved but left switched off.');
+                else if (r?.lockedPresets?.length) this.notify.warning(`Saved. ${r.lockedPresets.join(', ')} need a licence and were not added.`);
+                else if (r?.rejected?.length) this.notify.warning(`Saved. Ignored invalid entries: ${r.rejected.slice(0, 5).join(', ')}`);
+                else this.notify.success('Site access settings saved');
                 this.reload();
                 this.loadSetup();
             },
@@ -1781,4 +2021,126 @@ export class GeoBlockComponent implements OnInit, OnDestroy {
             },
         });
     }
+
+    // ── 0.15.0: tier, business hours, maintenance, "Add my IP", settings ──
+    /** Premium = licence or active evaluation. Unknown (still loading) counts as premium so nothing flashes locked. */
+    isPremium(): boolean { return !this.licMeta || this.licMeta.tier !== 'free'; }
+    isArr(v: any): boolean { return Array.isArray(v); }
+
+    private resetForms() {
+        this.scheduleForm = null;
+        this.maintenanceForm = null;
+        if (this.tab === 'hours') this.ensureScheduleForm();
+        if (this.tab === 'maintenance') this.ensureMaintenanceForm();
+    }
+
+    ensureScheduleForm() {
+        if (!this.current || this.scheduleForm) return;
+        const sch = this.current.schedule;
+        this.scheduleOn = !!sch && sch.outsideAction !== 'allow';
+        this.scheduleForm = {
+            timezone: sch?.timezone || (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { return 'UTC'; } })(),
+            days: (sch?.days || []).map(Number),
+            from: sch?.from || '',
+            to: sch?.to || '',
+            outsideAction: sch?.outsideAction || 'block',
+            outsideMessage: sch?.outsideMessage || '',
+        };
+    }
+
+    toggleDay(n: number) {
+        if (!this.scheduleForm) return;
+        const days = this.scheduleForm.days || [];
+        this.scheduleForm.days = days.includes(n) ? days.filter(d => d !== n) : [...days, n].sort();
+        this.markDirty();
+    }
+
+    ensureMaintenanceForm() {
+        if (!this.current || this.maintenanceForm) return;
+        const m = this.current.maintenance;
+        const local = (iso?: string) => {
+            if (!iso) return '';
+            const d = new Date(iso);
+            if (isNaN(d.getTime())) return '';
+            const pad = (x: number) => String(x).padStart(2, '0');
+            return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        };
+        this.maintenanceOn = !!m;
+        this.maintenanceForm = { startsAt: local(m?.startsAt), endsAt: local(m?.endsAt), message: m?.message || '' };
+        this.maintenanceIpsText = (m?.allowedIps || []).join('\n');
+    }
+
+    addMyIp() {
+        if (!this.current) return;
+        this.addingMyIp = true;
+        this.http.post<any>('/geo-block/admin/add-my-ip', { token: this.current.token }).subscribe({
+            next: r => {
+                this.addingMyIp = false;
+                if (this.current && Array.isArray(r?.ipAllowlist)) this.current.ipAllowlist = r.ipAllowlist;
+                this.notify.success(r?.added ? `Added ${r.ip} to the allowlist` : `${r?.ip} is already allowed`);
+                this.cdr.markForCheck();
+            },
+            error: e => { this.addingMyIp = false; this.notify.error(this.errMsg(e, 'Adding your IP')); this.cdr.markForCheck(); },
+        });
+    }
+
+    loadSettings() {
+        this.http.get<any>('/geo-block/admin/settings').subscribe({
+            next: st => { this.applySettings(st); },
+            error: e => { this.notify.error(this.errMsg(e, 'Loading settings')); },
+        });
+    }
+
+    private applySettings(st: any) {
+        this.settings = st;
+        const e = st?.effective || {};
+        this.settingsForm = { ...e, botCustomText: (e.botCustom || []).join('\n') };
+        this.cdr.markForCheck();
+    }
+
+    hasOverrides(): boolean { return !!this.settings && Object.keys(this.settings.overrides || {}).length > 0; }
+
+    saveSettings() {
+        if (!this.settingsForm || !this.settings) return;
+        const f = this.settingsForm;
+        const eff = this.settings.effective || {};
+        // Only what differs from the effective value becomes an override.
+        const patch: any = {};
+        const set = (k: string, v: any) => { if (JSON.stringify(v) !== JSON.stringify(eff[k])) patch[k] = v; };
+        set('botMode', f.botMode);
+        if (f.botMode === 'custom') patch.botCustom = String(f.botCustomText || '').split(/\n+/).map((x: string) => x.trim()).filter(Boolean);
+        set('verifyBots', !!f.verifyBots);
+        set('rateLimitPerMinute', Number(f.rateLimitPerMinute));
+        set('storefrontHelperMaxAgeSec', Number(f.storefrontHelperMaxAgeSec));
+        set('supportEmail', String(f.supportEmail || '').trim());
+        set('hashAuditIps', !!f.hashAuditIps);
+        this.postSettings(patch, 'Settings saved');
+    }
+
+    resetSettings() {
+        const patch: any = {};
+        for (const k of Object.keys(this.settings?.overrides || {})) patch[k] = null;
+        this.postSettings(patch, 'Settings reset to the init options');
+    }
+
+    private postSettings(patch: any, ok: string) {
+        this.settingsSaving = true;
+        this.http.post<any>('/geo-block/admin/settings', patch).subscribe({
+            next: st => { this.settingsSaving = false; this.applySettings(st); this.notify.success(ok); },
+            error: e => { this.settingsSaving = false; this.notify.error(this.errMsg(e, 'Saving settings')); this.cdr.markForCheck(); },
+        });
+    }
+
+    loadDiagnostic() {
+        this.diag = null;
+        this.http.get<any>('/geo-block/admin/diagnostic').subscribe({
+            next: d => { this.diag = d; this.cdr.markForCheck(); },
+            error: e => { this.notify.error(this.errMsg(e, 'Country-source check')); },
+        });
+    }
+
+    sourceLabel(src: string): string {
+        return src === 'cdn' ? 'CDN header' : src === 'maxmind' ? 'local MaxMind database' : 'none found';
+    }
+
 }
