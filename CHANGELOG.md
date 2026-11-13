@@ -4,6 +4,60 @@ All notable changes to `@huloglobal/vendure-plugin-geo-block` are documented
 here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and this project adheres to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] — 2026-11-13
+
+Vendure ↔ WordPress parity wave. **Database migration required** unless you
+run `synchronize: true`: two new Channel custom fields (see the README,
+"Upgrading to 0.15"; the package ships `GeoBlockChannelFields1763020800000`).
+Default behaviour is unchanged: every new enforcement feature is opt-in.
+
+### Fixed
+- **IPv6 CIDR allowlists now match (B4).** IPv6 entries were compared as text, so `2001:db8::/48` never
+  matched anything. Addresses and ranges are now compared as bytes for IPv4 and IPv6 (IPv4-mapped forms
+  included), in the channel allowlist and the maintenance allowlist. The GraphQL save now validates IPs
+  too (it accepted `/0`).
+- **The free tier's 5-preset limit is enforced server-side (B4).** It was UI-only: the unlicensed REST
+  save, the GraphQL `geoBlockSaveChannel` and the Channel custom field all accepted the 32 premium
+  presets. All three now refuse a NEW premium preset without a licence or evaluation; presets saved
+  while licensed are kept, so a lapsed install can still edit its channels.
+- **Lockout refusal.** Rules that would allow nobody (an empty allow-list) are saved switched off with a
+  warning, on the admin page, REST and GraphQL, instead of blocking every visitor.
+
+### Added
+- **Server-side purchase enforcement** (opt-in per channel, `geoBlockEnforcePurchases`, default off,
+  also for existing channels). For a visitor the rules fully block, Vendure refuses `addItemToOrder` /
+  quantity increases (`OrderInterceptor`) and the move to `ArrangingPayment` (`OrderProcess`). A soft
+  block stays a banner. Fails open: unknown country, Admin API, lookup errors and exceptions all allow;
+  payments under way are never touched; crawlers get no purchase exemption. Free (hard block).
+- **Business hours tab** in the admin (days, hours, time zone, outside action, message), saved through
+  `POST /geo-block/admin/save` (`schedule`), validated server-side.
+- **Per-channel maintenance window** (`geoBlockMaintenance`) with its own tab: start/end (≤ 31 days),
+  extra IPs, message. The `maintenanceWindow` init option still covers every channel.
+- **Local MaxMind fallback** (`maxmindDbPath`): a MaxMind-format database already on the server is read
+  when no trusted CDN header gives the country. Self-contained reader (cross-checked against `mmdb-lib`
+  on GeoLite2-City), re-read when the file changes, never downloaded, private addresses never looked up;
+  a missing file means "unknown" (allowed).
+- **Reverse-DNS verification** for Googlebot / Bingbot (`verifyBots`, or the Settings tab): reverse +
+  forward-confirmed DNS with the server's resolver, cached, 2 s timeout.
+- **Add my IP** (`POST /geo-block/admin/add-my-ip`).
+- **Settings tab** (`GET/POST /geo-block/admin/settings`, SuperAdmin to change): init options are the
+  defaults; crawler mode/custom list, `verifyBots`, support e-mail, rate limit, helper cache age and
+  audit-IP hashing can be overridden (stored in `hulo_plugin_prefs`); security options shown read-only.
+- **Country-source diagnostic** (`GET /geo-block/admin/diagnostic`, Settings tab): your IP, country,
+  source (CDN header / MaxMind file / none), trusted-proxy state and what to fix.
+- **Status codes.** The HTML block page answers 403 (geo) or 503 + `Retry-After` (business hours,
+  maintenance) with `X-Robots-Tag: noindex`. `/check` keeps 200 JSON; `?status=1` opts into 403/503.
+- The simulator also reports the full pipeline (hours, maintenance) and the purchase verdict.
+
+### Changed
+- **Weekly report and set-up checklist are premium** (licence or evaluation). On the free tier the
+  report is not sent (send-test and preview answer 402) and `GET /geo-block/setup` returns no items;
+  settings are kept and both resume with a licence. `PREMIUM_FEATURES` updated.
+- The admin page marks the simulator and soft-block as premium and no longer says a soft block hides the
+  checkout (it is a banner only).
+- README: free tier enforces; simulator, audit log, report and checklist are premium; soft-block wording;
+  MaxMind is a local-file fallback; no-card evaluation; licence AGPL-3.0-only + licence key.
+
 ## [0.14.6] — 2026-11-13
 
 ### Security

@@ -7,8 +7,23 @@ country, by curated region preset (37 of them: EU, EEA, Schengen, GCC,
 ANZ, NATO, Commonwealth, …), by ISO-3166-2 subdivision (US states, CA
 provinces, AU states, DE Länder, IT regions, FR regions, ES autonomous
 communities, IN states, BR units, MX entities, UK constituent
-countries). Soft-block mode, IP allowlist, audit log, simulator and
-maintenance windows.
+countries). IPv4/IPv6 IP allowlist, business hours, per-channel maintenance
+windows, optional server-side purchase enforcement, a local MaxMind-file
+country fallback, soft-block mode, audit log and simulator.
+
+**Free vs licensed.** The free tier genuinely enforces: country and preset
+rules (5 presets: Worldwide, UK only, EU, North America, Oceania), the IP
+allowlist, business hours, maintenance windows, purchase enforcement (hard
+block), the crawler allowlist with optional reverse-DNS checks and the
+branded block page. A licence (or the 14-day evaluation) adds all 37
+presets, subdivisions, soft-block mode, the audit log and stats, the
+simulator, and the weekly report and set-up checklist.
+
+**New in 0.15:** server-side purchase enforcement (opt-in per channel) ·
+IPv6 CIDR allowlists · business-hours and per-channel maintenance tabs in
+the admin · local MaxMind database fallback · reverse-DNS check for
+Googlebot/Bingbot · "Add my IP" · Settings tab and country-source
+diagnostic · 403 / 503 + Retry-After on the block page.
 
 **New in 0.7:** SEO-safe bot allowlist so Googlebot / Bingbot / social
 crawlers bypass by default · per-channel business-hours schedule
@@ -19,7 +34,7 @@ Maintained by Wayne Garrison.
 
 ## Buy
 
-14-day free trial (card required, start it from the admin — nothing charged until day 15), then **£4.95/month**, or **£99 one-off lifetime** at
+14-day free evaluation (no card needed — start it from the admin), then **£4.95/month**, or **£99 one-off lifetime** at
 [elite.charity/licence/buy/vendure-plugin-geo-block](https://elite.charity/licence/buy/vendure-plugin-geo-block).
 Start the trial (or buy) from the plugin's admin page — checkout opens in a new tab and the key installs itself.
 
@@ -53,6 +68,11 @@ export const config: VendureConfig = {
 
             // -- Retention (opt-in) --
             retention: { days: 90 },
+
+            // -- Optional country fallback: a MaxMind-format file already on this server --
+            maxmindDbPath: '/usr/share/GeoIP/GeoLite2-Country.mmdb',
+            // -- Optional: Googlebot / Bingbot must pass a reverse-DNS check --
+            verifyBots: true,
         }),
     ],
 };
@@ -60,18 +80,35 @@ export const config: VendureConfig = {
 
 Add `GeoBlockPlugin.uiExtensions` to your `compileUiExtensions` config.
 
+### Upgrading to 0.15: database migration
+
+0.15.0 adds two Channel custom fields (`geoBlockMaintenance`,
+`geoBlockEnforcePurchases`). With `synchronize: true` nothing is needed.
+Otherwise generate a migration as usual (`npx vendure migrate`) or add the
+one the package ships:
+
+```ts
+import { GeoBlockChannelFields1763020800000 } from '@huloglobal/vendure-plugin-geo-block';
+// dbConnectionOptions: { migrations: [GeoBlockChannelFields1763020800000, /* … */] }
+```
+
+It only adds missing columns (safe next to a generated migration), works on
+MariaDB/MySQL and PostgreSQL, and leaves purchase enforcement **off** on
+every existing channel.
+
 ### Admin UI
 
 - **Settings → Geo Block** in the admin navigation (shared
   `GeoBlockNavModule`, registered by `uiExtensions`), opening the page at
-  `/admin/extensions/geo-block`: channel picker, Rules, Block page, IP
-  allowlist, Simulate and Stats tabs, with a live plain-English readout of
-  what the current rules do.
+  `/admin/extensions/geo-block`: channel picker, Rules (including the
+  purchase-enforcement switch), Block page, IP allowlist (with **Add my
+  IP**), Business hours, Maintenance, Simulate, Stats and Settings tabs,
+  with a live plain-English readout of what the current rules do.
 - **Dashboard → Add widget → Geo Block**: blocked, soft-blocked and unique
   IPs over the last 7 days, plus the licence lifecycle notice.
-- **Set-up checklist** and **Weekly report** cards on the landing page (see
-  below), the licence banner with buy-from-admin, and one update banner
-  when a new version is on npm.
+- **Set-up checklist** and **Weekly report** cards on the landing page
+  (premium, see below), the licence banner with buy-from-admin, and one
+  update banner when a new version is on npm.
 
 
 > **Visitor IP:** the plugin uses Express's `req.ip` (set `trustProxy` on the
@@ -82,15 +119,21 @@ Add `GeoBlockPlugin.uiExtensions` to your `compileUiExtensions` config.
 > request came through a proxy trusted by `trustProxy`. Behind anything other
 > than Cloudflare, set `trustedCountryHeaders` to your edge's one header (e.g.
 > `['x-country-code']`) so a visitor cannot send a `CF-IPCountry` of their own.
-> A visitor whose country cannot be resolved is allowed (fail-open).
+> Without a trusted header the plugin can read a local MaxMind-format file
+> (`maxmindDbPath`). A visitor whose country cannot be resolved is allowed
+> (fail-open). Admin → Geo Block → Settings shows where YOUR country came
+> from (CDN header, MaxMind file or nothing) and why.
 > Audit rows are pruned after 90 days / 500 000 rows by default
 > (`retention: false` keeps everything).
 
 > **Unlicensed / after the evaluation:** saved rules are still enforced on
-> `/geo-block/site-config` and `/geo-block/check`, but on the free tier —
-> `mode` is always `block` (no soft-block banner), subdivision rules are
-> ignored, only the 5 free presets can be picked, and no audit log is
-> written. The public `site-config` and `check` apply the same gate.
+> `/geo-block/site-config`, `/geo-block/check` and (when switched on) the
+> server-side purchase enforcement, on the free tier: `mode` is always
+> `block` (no soft-block banner), subdivision rules are ignored, only the 5
+> free presets can be **added** (on every save path: the admin page, the
+> REST and GraphQL saves and the Channel custom field; presets saved while
+> licensed are kept), and no audit log is written. The simulator, stats,
+> weekly report and set-up checklist pause; settings and data are kept.
 
 ## Feature tour
 
@@ -121,10 +164,52 @@ instance).
 
 ### Soft-block mode
 
-Per-channel `mode` field. `block` hides the storefront entirely;
-`soft` renders it with a "we don't ship to your country" banner and
-hides the checkout button. The verdict `mode` field is returned on
-`/geo-block/check` so the storefront knows how to render.
+Per-channel `mode` field (premium). `block` hides the storefront
+entirely; `soft` renders it with a "we don't ship to your country"
+banner. A soft block is a banner only: it does not hide or refuse the
+checkout (use a full block with purchase enforcement for that). The
+verdict `mode` field is returned on `/geo-block/check` so the storefront
+knows how to render. On the free tier `soft` acts as `block`.
+
+### Server-side purchase enforcement (opt-in)
+
+The storefront helper and `/check` only advise the storefront; a visitor
+can skip them and call the Shop API directly. Switch on **Refuse purchases
+from blocked visitors** (Rules tab, or the channel custom field
+`geoBlockEnforcePurchases`) and Vendure itself refuses, for a visitor the
+rules fully block (country rules, business hours, maintenance):
+
+- `addItemToOrder` and quantity increases (an `OrderInterceptorError`
+  carrying the channel's block message), and
+- the move to `ArrangingPayment` (checkout).
+
+It is **off by default**, including on existing channels after the upgrade,
+and it **fails open**: an unknown country, an Admin-API call (draft
+orders), any lookup error or exception means "allow". A soft block stays a
+banner. The IP allowlist still applies; crawlers get no exemption for
+purchases (a User-Agent is not identity). Payments already under way
+(webhooks, settlement) are never touched. Refusals are written to the
+audit log (premium) with reason `purchase:<reason>`.
+
+### Business hours and maintenance
+
+**Business hours** (Business hours tab, or the `geoBlockSchedule` JSON
+field): days, opening and closing time (overnight ranges work), time zone,
+and what happens outside them: full block, soft block (premium) or allow.
+**Maintenance** (Maintenance tab, per channel; the `maintenanceWindow` init
+option still covers every channel): start and end (at most 31 days),
+extra IPs that get in, and a message. Both apply even when the country
+rules are off. The IP allowlist and allowlisted crawlers bypass both (so
+search engines keep the site indexed).
+
+### Status codes
+
+The HTML block page (`/geo-block/blocked`) answers **403** for a geo
+refusal and **503 with `Retry-After`** for business hours and maintenance,
+with `X-Robots-Tag: noindex`, so crawlers and caches never store it as the
+page. `/geo-block/check` keeps answering 200 with JSON (what the
+storefront helper expects); add `?status=1` to get the same 403 / 503 for a
+full block, for edge middleware that only looks at the status.
 
 ### Generic subdivisions
 
@@ -133,32 +218,60 @@ the channel custom field `geoBlockAllowedSubdivisions`. Catalogue at
 `GET /geo-block/subdivisions` covers 11 countries (200+ subdivisions).
 Legacy GB-only `allowedGbRegions` is preserved for back-compat.
 
-### IP allowlist with IPv4 CIDR
+### IP allowlist (IPv4 and IPv6, with CIDR)
 
-Per-channel list of IPs / ranges that bypass every rule. Use for
-offices, oncall, payment-processor probes, monitoring.
+Per-channel list of IPs / ranges (`203.0.113.0/24`, `2001:db8::/48`; /8
+or narrower) that bypass every rule. Use for offices, oncall,
+payment-processor probes, monitoring. **Add my IP** adds the address the
+server sees for you. Before 0.15 IPv6 ranges were compared as text and
+never matched. Saving rules that would allow nobody (an empty allow-list)
+is refused: they are saved switched off, with a warning.
 
-### Audit log + stats
+### Crawlers and reverse DNS
+
+Well-known search and social crawlers bypass the rules for page views by
+default (`botAllowlist`, or the Settings tab: strict, permissive, custom
+list or off). With **Verify Googlebot and Bingbot** (`verifyBots`) a
+visitor claiming to be one of them must pass a reverse + forward DNS check
+(the server's own resolver, cached a day, 2 s timeout); a fake "Googlebot"
+is then an ordinary visitor.
+
+### Audit log + stats (premium)
 
 Every block decision recorded in `geo_block_event` with country, region,
 IP (hashed by default), UA, channel and reason. Admin Stats panel
 shows top blocked countries, daily series and reason breakdown.
 
-### "What-if" simulator
+### "What-if" simulator (premium)
 
 `POST /geo-block/admin/simulate` dry-runs a hypothetical visitor against
 current rules without persisting anything — try any country / UK
-region / IP and see exactly what would happen.
+region / IP and see exactly what would happen, for a page view and for a
+purchase.
 
 ### Custom block page
 
 Per-channel `blockMessage`, `blockRedirectUrl`, `blockLogoUrl`. Falls
 back to sensible defaults per block reason.
 
-### Proxy-aware
+### Proxy-aware, with a local MaxMind fallback
 
 Reads `cf-ipcountry` / Akamai / Fastly region headers from a trusted
-proxy (see *Visitor country* above). Saves a MaxMind lookup per request.
+proxy (see *Visitor country* above). Without one, `maxmindDbPath` points
+at a MaxMind-format database already on the server (GeoLite2-Country or
+-City, GeoIP2-Country, DB-IP Lite MMDB). It is read locally, re-read when
+the file changes (keep it fresh with MaxMind's `geoipupdate`) and never
+downloaded by the plugin; private and reserved addresses are never looked
+up. A missing or broken file means "country unknown" (allowed).
+
+### Settings tab
+
+`GeoBlockPlugin.init()` options are the defaults; the Settings tab
+(SuperAdmin) overrides the safe ones: crawler mode and custom list,
+`verifyBots`, the support e-mail, the public rate limit, the helper's cache
+age and audit-IP hashing. Reset returns to the init value. Trusted
+headers, the signing secret, the IP salt and the MaxMind path stay in code
+and are shown read-only.
 
 ### Security
 
@@ -178,6 +291,11 @@ proxy (see *Visitor country* above). Saves a MaxMind lookup per request.
 - Security headers via the licence-sdk helper on every response.
 
 ## Weekly report, setup checklist and dashboard widget
+
+The weekly report and the set-up checklist are **premium** (licence or
+evaluation). On the free tier the report is not sent (Send-a-test and
+Preview answer 402) and the checklist is not shown; settings are kept and
+both resume when a licence is active.
 
 **Weekly report.** Every Monday at 08:00 (server-local time) the worker
 process emails a short report: how many visits Geo Block hard-blocked and
@@ -225,25 +343,29 @@ never addresses or URLs. `HULO_HEARTBEAT_DISABLED=true` stops the heartbeat.
 | Method | Path | Auth | Purpose |
 | --- | --- | --- | --- |
 | `GET` | `/geo-block/site-config` | public | resolved channel rules (cache client-side) |
-| `GET` | `/geo-block/check` | public | per-request decision + reason (logs to audit) |
+| `GET` | `/geo-block/check` | public | per-request decision + reason (logs to audit); `?status=1` → 403/503 |
 | `GET` | `/geo-block/presets` | public | 37-preset catalogue (with `countries`) |
 | `GET` | `/geo-block/subdivisions` | public | subdivision catalogue (11 countries) |
 | `GET` | `/geo-block/admin/channels` | admin | list channels + rules |
 | `POST` | `/geo-block/admin/save` | admin | save a channel's rules |
 | `GET` | `/geo-block/admin/stats` | admin | block totals + top countries + series |
-| `POST` | `/geo-block/admin/simulate` | admin | dry-run a hypothetical visitor |
+| `POST` | `/geo-block/admin/simulate` | admin | dry-run a hypothetical visitor (premium) |
+| `POST` | `/geo-block/admin/add-my-ip` | admin (UpdateCatalog) | add the caller's IP to a channel's allowlist `{token}` |
+| `GET` | `/geo-block/admin/diagnostic` | admin | country-source diagnostic for the caller |
+| `GET` | `/geo-block/admin/settings` | admin | effective settings, overrides, read-only init options |
+| `POST` | `/geo-block/admin/settings` | SuperAdmin | override settings (`null` resets one) |
 | `POST` | `/geo-block/admin/gc` | admin | prune old audit rows |
 | `GET` | `/geo-block/status` | admin | version + update status |
 | `GET` | `/geo-block/licence/status` | admin | licence, tier, lifecycle notice, premium features, recent stats |
 | `POST` | `/geo-block/eval/remind-me` | admin | "email me before the evaluation ends" opt-in |
-| `GET` | `/geo-block/setup` | admin | set-up checklist (`items`, `complete`) |
+| `GET` | `/geo-block/setup` | admin | set-up checklist (`items`, `complete`, `premium`; empty on the free tier) |
 | `GET` | `/geo-block/widget` | admin | dashboard widget feed (7-day figures) |
 | `GET` | `/geo-block/digest/settings` | admin | weekly report settings |
 | `POST` | `/geo-block/digest/settings` | admin | update `{enabled?, recipient?}` |
-| `POST` | `/geo-block/digest/send-test` | admin | send this week's report now `{to?}` |
-| `GET` | `/geo-block/digest/preview` | admin | this week's report as HTML |
+| `POST` | `/geo-block/digest/send-test` | admin | send this week's report now `{to?}` (premium) |
+| `GET` | `/geo-block/digest/preview` | admin | this week's report as HTML (premium) |
 | `GET` | `/geo-block/hulo-geo.js` | public | storefront drop-in helper JS |
-| `GET` | `/geo-block/blocked` | public | branded block page (HTML or JSON) |
+| `GET` | `/geo-block/blocked` | public | branded block page (HTML 403 / 503 + Retry-After, or JSON) |
 
 ## Storefront integration
 
@@ -292,5 +414,7 @@ User manual + screenshots:
 
 ## Licence
 
-Commercial. Buy at
+The source is licensed under the GNU AGPL version 3 (`AGPL-3.0-only`, see
+`LICENSE`). A licence key unlocks the premium features listed above; buy
+one at
 [elite.charity/licence/buy/vendure-plugin-geo-block](https://elite.charity/licence/buy/vendure-plugin-geo-block).
