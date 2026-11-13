@@ -20,9 +20,13 @@ import { isLicensed, premiumFeatureError, adapterFor } from '@huloglobal/vendure
 import {
     FREE_TIER_PRESET_KEYS,
     isAllowed,
+    isFreeTierPreset,
+    isIpOrCidr,
     REGION_PRESETS,
     resolveAllowedCountries,
 } from './geo-regions';
+import { sanitiseMaintenance, sanitiseSchedule } from './decision';
+import { GeoBlockChannelRules } from './channel-rules';
 import { GeoBlockPlugin } from './plugin';
 import { channelPermitted } from './channel-access';
 
@@ -54,6 +58,14 @@ export const geoBlockAdminApiSchema = gql`
         blockMessage: String
         blockRedirectUrl: String
         ipAllowlist: [String!]!
+        "Business-hours schedule as JSON (null = none)."
+        scheduleJson: String
+        "This channel's maintenance window as JSON (null = none)."
+        maintenanceJson: String
+        "Server-side purchase enforcement (off by default)."
+        enforcePurchases: Boolean!
+        "True when the last save would have blocked every visitor, so the rules were left switched off."
+        lockout: Boolean
     }
 
     type GeoBlockStatsTotals {
@@ -98,6 +110,11 @@ export const geoBlockAdminApiSchema = gql`
         blockMessage: String
         blockRedirectUrl: String
         ipAllowlist: [String!]
+        "JSON business-hours schedule; empty string clears it."
+        scheduleJson: String
+        "JSON maintenance window {startsAt, endsAt, allowedIps, message}; empty string clears it."
+        maintenanceJson: String
+        enforcePurchases: Boolean
     }
 
     input GeoBlockSimulateInput {
@@ -121,7 +138,7 @@ export const geoBlockAdminApiSchema = gql`
 @Resolver()
 @Injectable()
 export class GeoBlockAdminResolver {
-    constructor(private connection: TransactionalConnection) {}
+    constructor(private connection: TransactionalConnection, private rules: GeoBlockChannelRules) {}
 
     @Query()
     @Allow(Permission.ReadCatalog)
@@ -153,7 +170,10 @@ export class GeoBlockAdminResolver {
                     \`customFieldsGeoblockallowedregions\`   AS regionPreset,
                     \`customFieldsGeoblockblockmessage\`     AS blockMessage,
                     \`customFieldsGeoblockblockredirecturl\` AS blockRedirectUrl,
-                    \`customFieldsGeoblockipallowlist\`      AS ipAllowlist
+                    \`customFieldsGeoblockipallowlist\`      AS ipAllowlist,
+                    \`customFieldsGeoblockschedule\`         AS scheduleJson,
+                    \`customFieldsGeoblockmaintenance\`      AS maintenanceJson,
+                    \`customFieldsGeoblockenforcepurchases\` AS enforcePurchases
              FROM channel`,
             [],
         );
@@ -170,6 +190,9 @@ export class GeoBlockAdminResolver {
             blockMessage: r.blockMessage || null,
             blockRedirectUrl: r.blockRedirectUrl || null,
             ipAllowlist: splitList(r.ipAllowlist),
+            scheduleJson: r.scheduleJson || null,
+            maintenanceJson: r.maintenanceJson || null,
+            enforcePurchases: !!Number(r.enforcePurchases || 0),
         }));
     }
 
@@ -226,33 +249,83 @@ export class GeoBlockAdminResolver {
         if (!input?.channelToken) throw new Error('channelToken required');
         // The input names the channel: require UpdateCatalog in THAT channel.
         if (!channelPermitted(ctx, { token: String(input.channelToken) }, [Permission.UpdateCatalog])) throw new Error('channel not found');
+        const existingRows = await adapterFor(this.connection.rawConnection).query(
+            `SELECT \`customFieldsGeoblockenabled\`          AS enabled,
+                    \`customFieldsGeoblockallowedregions\`   AS allowedRegions,
+                    \`customFieldsGeoblockallowedcountries\` AS allowedCountries,
+                    \`customFieldsGeoblockblockedcountries\` AS blockedCountries
+             FROM channel WHERE token = ?`,
+            [input.channelToken],
+        );
+        const existing = (existingRows as any[])[0];
+        if (!existing) throw new Error('channel not found');
         const set: string[] = [];
         const params: any[] = [];
+        const cleanList = (val: any[], valid?: (x: string) => boolean): string[] => {
+            const out = Array.from(new Set(val.filter((x: any) => typeof x === 'string').map((x: string) => x.trim()).filter(Boolean).slice(0, 500)));
+            const bad = valid ? out.filter(x => !valid(x)) : [];
+            if (bad.length) throw new Error(`Invalid value(s): ${bad.slice(0, 5).join(', ')}`);
+            return out;
+        };
         // Same columns and JSON-array storage as the REST save route (the two used to disagree).
         const push = (col: string, val: any) => {
             if (val === undefined) return;
             set.push(`\`${col}\` = ?`);
-            params.push(Array.isArray(val) ? JSON.stringify(Array.from(new Set(val.filter((x: any) => typeof x === 'string').map((x: string) => x.trim()).filter(Boolean).slice(0, 500)))) : val);
+            params.push(Array.isArray(val) ? JSON.stringify(val) : val);
         };
-        push('customFieldsGeoblockenabled', input.enabled === undefined ? undefined : !!input.enabled);
-        push('customFieldsGeoblockmode', input.mode === undefined ? undefined : (input.mode === 'soft' ? 'soft' : 'block'));
-        push('customFieldsGeoblockallowedcountries', input.allowedCountries?.map((c: string) => c.toUpperCase()));
-        push('customFieldsGeoblockblockedcountries', input.blockedCountries?.map((c: string) => c.toUpperCase()));
-        push('customFieldsGeoblockallowedgbregions', input.allowedGbRegions?.map((c: string) => c.toUpperCase()));
-        push('customFieldsGeoblockallowedregions', input.regionPreset === undefined ? undefined : (input.regionPreset ? [String(input.regionPreset).toUpperCase()] : []));
-        push('customFieldsGeoblockblockmessage', input.blockMessage === undefined ? undefined : String(input.blockMessage).slice(0, 4000));
-        push('customFieldsGeoblockblockredirecturl', input.blockRedirectUrl === undefined ? undefined : (/^https?:\/\/[^\s]+$/i.test(String(input.blockRedirectUrl)) ? String(input.blockRedirectUrl).slice(0, 2048) : ''));
-        push('customFieldsGeoblockipallowlist', input.ipAllowlist);
+        const isCountry = (x: string) => /^[A-Z]{2}$/.test(x);
+        let regionList: string[] | undefined;
+        if (input.regionPreset !== undefined) {
+            const key = input.regionPreset ? String(input.regionPreset).toUpperCase() : '';
+            if (key && key !== 'WORLDWIDE' && !REGION_PRESETS.some(p => String(p.key).toUpperCase() === key)) throw new Error(`Unknown region preset ${key}`);
+            // Free tier: 5 of the 37 presets — enforced here too, not only in the UI.
+            // A preset already saved on this channel (while licensed) may stay.
+            const saved = splitList(existing.allowedRegions).map(x => x.toUpperCase());
+            if (key && !GeoBlockPlugin.hasPremiumAccess() && !isFreeTierPreset(key) && !saved.includes(key)) {
+                throw new Error(premiumFeatureError('vendure-plugin-geo-block').message + ` (region preset ${key}; the free tier offers ${FREE_TIER_PRESET_KEYS.join(', ')})`);
+            }
+            regionList = key ? [key] : [];
+        }
+        const allowedCountries = input.allowedCountries === undefined || input.allowedCountries === null ? undefined : cleanList(input.allowedCountries.map((c: string) => String(c).toUpperCase()), isCountry);
+        const blockedCountries = input.blockedCountries === undefined || input.blockedCountries === null ? undefined : cleanList(input.blockedCountries.map((c: string) => String(c).toUpperCase()), isCountry);
+        // Lockout refusal: rules that would block every visitor are saved switched off.
+        let enabled: boolean | undefined = input.enabled === undefined || input.enabled === null ? undefined : !!input.enabled;
+        const finalEnabled = enabled ?? !!Number(existing.enabled || 0);
+        const resolved = resolveAllowedCountries({
+            regions: regionList ?? splitList(existing.allowedRegions),
+            extraAllowed: allowedCountries ?? splitList(existing.allowedCountries),
+            blocked: blockedCountries ?? splitList(existing.blockedCountries),
+        });
+        const lockout = finalEnabled && resolved.allowed !== null && resolved.allowed.length === 0;
+        if (lockout) enabled = false;
+        push('customFieldsGeoblockenabled', enabled);
+        push('customFieldsGeoblockmode', input.mode === undefined || input.mode === null ? undefined : (input.mode === 'soft' ? 'soft' : 'block'));
+        push('customFieldsGeoblockallowedcountries', allowedCountries);
+        push('customFieldsGeoblockblockedcountries', blockedCountries);
+        push('customFieldsGeoblockallowedgbregions', input.allowedGbRegions == null ? undefined : cleanList(input.allowedGbRegions.map((c: string) => String(c).toUpperCase())));
+        push('customFieldsGeoblockallowedregions', regionList);
+        push('customFieldsGeoblockblockmessage', input.blockMessage == null ? undefined : String(input.blockMessage).slice(0, 4000));
+        push('customFieldsGeoblockblockredirecturl', input.blockRedirectUrl == null ? undefined : (/^https?:\/\/[^\s]+$/i.test(String(input.blockRedirectUrl)) ? String(input.blockRedirectUrl).slice(0, 2048) : ''));
+        push('customFieldsGeoblockipallowlist', input.ipAllowlist == null ? undefined : cleanList(input.ipAllowlist.map((x: string) => String(x).toLowerCase()), isIpOrCidr));
+        if (input.scheduleJson != null) {
+            const sch = input.scheduleJson === '' ? null : sanitiseSchedule(JSON.parse(String(input.scheduleJson)));
+            push('customFieldsGeoblockschedule', sch ? JSON.stringify(sch) : null);
+        }
+        if (input.maintenanceJson != null) {
+            const m = input.maintenanceJson === '' ? null : sanitiseMaintenance(JSON.parse(String(input.maintenanceJson)), isIpOrCidr);
+            push('customFieldsGeoblockmaintenance', m ? JSON.stringify(m) : null);
+        }
+        push('customFieldsGeoblockenforcepurchases', input.enforcePurchases == null ? undefined : !!input.enforcePurchases);
         if (!set.length) throw new Error('no fields to update');
         params.push(input.channelToken);
-        const exists = await adapterFor(this.connection.rawConnection).query('SELECT id FROM channel WHERE token = ?', [input.channelToken]);
-        if (!(exists as any[]).length) throw new Error('channel not found');
         await adapterFor(this.connection.rawConnection).query(
             `UPDATE channel SET ${set.join(', ')} WHERE token = ?`,
             params,
         );
+        this.rules.invalidate(String(input.channelToken));
         const rows = await this.geoBlockChannels(ctx);
-        return rows.find((r: any) => r.channelToken === input.channelToken);
+        const row = rows.find((r: any) => r.channelToken === input.channelToken);
+        return row ? { ...row, lockout } : row;
     }
 
     @Mutation()

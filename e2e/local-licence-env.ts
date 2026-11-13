@@ -5,7 +5,7 @@
  */
 import * as http from 'http';
 
-export const LICENCE_STUB_PORT = 3069;
+export const LICENCE_STUB_PORT = Number(process.env.GEO_LICENCE_STUB_PORT || 3469);
 const base = `http://127.0.0.1:${LICENCE_STUB_PORT}`;
 process.env.HULO_LICENCE_EVAL_URL = `${base}/licence/eval/register`;
 process.env.HULO_LICENCE_HEARTBEAT_URL = `${base}/licence/heartbeat`;

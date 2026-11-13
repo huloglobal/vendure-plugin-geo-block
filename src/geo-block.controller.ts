@@ -14,17 +14,29 @@ import { SUBDIVISIONS, hasSubdivisions } from './subdivisions';
 import {
     isAllowed,
     ipMatchesAny,
+    isFreeTierPreset,
+    isIpOrCidr,
     FREE_TIER_PRESET_KEYS,
     REGION_PRESETS,
     presetCountries,
     resolveAllowedCountries,
 } from './geo-regions';
+import {
+    buildConfig, DEFAULT_SITE_CONFIG, GeoBlockChannelRules, parseJsonSafely, parseList, parseMaintenance, parseSubdivisions, rulesFromRow, SiteConfig,
+} from './channel-rules';
+import { decide, defaultMessage, httpStatusFor, inWindow, sanitiseMaintenance, sanitiseSchedule, Verdict } from './decision';
+import { CrawlerVerifier, claimedVerifiableBot } from './bot-verify';
+import { diagnose, locate } from './locate';
+import { effectiveSettings, getOverrides, refreshOverrides, sanitiseOverrides, saveOverrides } from './settings';
+import { setRefusalListener } from './enforcement';
 import { ensureStoredSecret } from './stored-secret';
 import { channelPermitted, isSuperAdmin, permittedChannelIds } from './channel-access';
 import { GeoBlockPlugin, getOptions } from './plugin';
-import { getRealIp, getResolvedCountry, getResolvedRegion, normaliseIp } from './proxy-headers';
-import { isAllowlistedBot, matchedBotEntry } from './bot-detect';
+import { getRealIp, getResolvedRegion, normaliseIp } from './proxy-headers';
+import { isAllowlistedBot } from './bot-detect';
 import { BusinessHoursSchedule, checkSchedule } from './schedule';
+
+const DEFAULTS = DEFAULT_SITE_CONFIG;
 import { buildHuloGeoJs, buildBlockedPageHtml } from './storefront-assets';
 import { GeoBlockEngagementService, PREMIUM_FEATURES } from './engagement';
 
@@ -36,14 +48,6 @@ const loggerCtx = 'GeoBlockController';
 
 /** Per-install audit-IP salt resolved at boot when `ipSalt` is not configured (cached per process). */
 let generatedIpSalt: string | null = null;
-
-/** JSON.parse a value from a channel row's `text` field, tolerating
- *  null / empty. Returns null on any parse failure. */
-function parseJsonSafely<T = any>(raw: any): T | null {
-    if (!raw) return null;
-    if (typeof raw === 'object') return raw as T;
-    try { return JSON.parse(String(raw)) as T; } catch { return null; }
-}
 
 /** Minimal HTML-escape for user-supplied text going into the block
  *  page template. */
@@ -69,72 +73,6 @@ function requireAdmin(ctx: RequestContext, res: Response, write: boolean | 'supe
     return true;
 }
 
-interface SiteConfig {
-    channelToken: string;
-    geoBlock: {
-        enabled: boolean;
-        mode: 'block' | 'soft';
-        allowedCountries: string[] | null;
-        blockedCountries: string[];
-        allowedGbRegions: string[];
-        allowedSubdivisions: Record<string, string[]>;
-        allowedRegions: string[];
-        blockMessage: string;
-        blockRedirectUrl: string | null;
-        blockLogoUrl: string | null;
-    };
-    companyData: {
-        showCompanyNumber: boolean;
-        companyNumber: string;
-    };
-}
-
-const DEFAULTS: SiteConfig = {
-    channelToken: '',
-    geoBlock: {
-        enabled: false,
-        mode: 'block',
-        allowedCountries: ['GB'],
-        blockedCountries: [],
-        allowedGbRegions: [],
-        allowedSubdivisions: {},
-        allowedRegions: [],
-        blockMessage: '',
-        blockRedirectUrl: null,
-        blockLogoUrl: null,
-    },
-    companyData: { showCompanyNumber: false, companyNumber: '' },
-};
-
-function parseSubdivisions(raw: any): Record<string, string[]> {
-    if (!raw) return {};
-    if (typeof raw === 'object' && !Array.isArray(raw)) {
-        const out: Record<string, string[]> = {};
-        for (const [k, v] of Object.entries(raw)) {
-            if (Array.isArray(v)) out[k.toUpperCase()] = v.filter(x => typeof x === 'string').map(x => x.toUpperCase());
-        }
-        return out;
-    }
-    if (typeof raw === 'string') {
-        try {
-            return parseSubdivisions(JSON.parse(raw));
-        } catch {
-            return {};
-        }
-    }
-    return {};
-}
-
-const parseList = (raw: any, fallback: string[] = []): string[] => {
-    if (Array.isArray(raw)) return raw.filter(v => typeof v === 'string');
-    if (typeof raw !== 'string' || !raw.length) return fallback;
-    try {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) return parsed.filter(v => typeof v === 'string');
-    } catch {}
-    return raw.split(',').map(s => s.trim()).filter(Boolean);
-};
-
 /**
  * Public + admin endpoints for the storefront geo-block.
  *
@@ -157,21 +95,28 @@ const parseList = (raw: any, fallback: string[] = []): string[] => {
 export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestroy {
     private limiter: RateLimiter | null = null;
     private stopRetention: (() => void) | null = null;
-    /** Channel rules change rarely; `/check`, `/site-config` and `/blocked` read them per page view. */
-    private rowCache = new Map<string, { row: any; exp: number }>();
-    private static readonly ROW_TTL_MS = 10_000;
+    private limiterKey = '';
+    private crawlerVerifier = new CrawlerVerifier();
 
     constructor(
         private connection: TransactionalConnection,
         private processContext: ProcessContext,
         private engagement: GeoBlockEngagementService,
+        private rules: GeoBlockChannelRules,
     ) {}
 
     async onApplicationBootstrap(): Promise<void> {
         const opts = getOptions();
-        const rl = opts.rateLimit || { capacity: 120, windowMs: 60_000 };
-        this.limiter = new RateLimiter({ capacity: rl.capacity, windowMs: rl.windowMs });
+        await refreshOverrides(this.engagement.prefs, true);
+        this.ensureLimiter();
         await this.resolveIpSalt();
+        // Purchases refused by the server-side enforcement land in the audit log too.
+        setRefusalListener((_ctx, v, info) => {
+            void this.logEvent({
+                channelId: info.channelId, country: info.country, region: info.region, ip: info.ip,
+                ua: info.ua, url: 'purchase', decision: 'block', reason: `purchase:${v.reason}`.slice(0, 64),
+            });
+        });
         // Only the server answers HTTP; the worker must not run a second sweeper / claim poller.
         if (this.processContext.isWorker) return;
         void this.purchaseClaimClient().resume();
@@ -211,7 +156,17 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
         }
     }
 
+    /** (Re)build the public rate limiter when its effective settings change. */
+    private ensureLimiter(): void {
+        const rl = effectiveSettings().rateLimit;
+        const key = `${rl.capacity}/${rl.windowMs}`;
+        if (this.limiter && key === this.limiterKey) return;
+        this.limiter = new RateLimiter({ capacity: rl.capacity, windowMs: rl.windowMs });
+        this.limiterKey = key;
+    }
+
     private rateLimited(req: Request, res: Response, bucket: string): boolean {
+        void refreshOverrides(this.engagement.prefs).then(() => this.ensureLimiter());
         const ip = getRealIp(req, getOptions().trustedIpHeaders) || '';
         if (!ip || !this.limiter) return false;
         if (!this.limiter.allow(`${bucket}|${ip}`)) {
@@ -277,7 +232,9 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
     @Get('digest/settings')
     async digestSettings(@Ctx() ctx: RequestContext, @Res() res: Response) {
         if (!requireAdmin(ctx, res, false)) return;
-        return res.json(await this.engagement.digest.settings());
+        // Settings stay readable/editable on the free tier (kept for when a
+        // licence returns); `premium: false` tells the UI nothing is sent.
+        return res.json({ ...(await this.engagement.digest.settings()), premium: GeoBlockPlugin.hasPremiumAccess() });
     }
 
     @Post('digest/settings')
@@ -287,7 +244,7 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
         if (typeof body?.enabled === 'boolean') patch.enabled = body.enabled;
         if (body?.recipient !== undefined) patch.recipient = body.recipient === null ? null : String(body.recipient);
         try {
-            return res.json(await this.engagement.digest.updateSettings(patch));
+            return res.json({ ...(await this.engagement.digest.updateSettings(patch)), premium: GeoBlockPlugin.hasPremiumAccess() });
         } catch (e: any) {
             return res.status(400).json({ message: e?.message || 'Invalid settings' });
         }
@@ -296,6 +253,8 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
     @Post('digest/send-test')
     async digestSendTest(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: any) {
         if (!requireAdmin(ctx, res, true)) return;
+        // The weekly report is a premium feature (licence or evaluation).
+        if (!GeoBlockPlugin.hasPremiumAccess()) return res.status(402).json(premiumFeatureError('vendure-plugin-geo-block'));
         const r = await this.engagement.digest.sendNow(String(body?.to || '').trim() || null);
         return res.json({ sent: r.sent, to: r.to, reason: r.reason, subject: r.preview.subject });
     }
@@ -304,6 +263,7 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
     @Get('digest/preview')
     async digestPreview(@Ctx() ctx: RequestContext, @Res() res: Response) {
         if (!requireAdmin(ctx, res, false)) return;
+        if (!GeoBlockPlugin.hasPremiumAccess()) return res.status(402).json(premiumFeatureError('vendure-plugin-geo-block'));
         const mail = await this.engagement.preview();
         applySecurityHeaders(res);
         res.type('text/html');
@@ -315,8 +275,10 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
     @Get('setup')
     async setup(@Ctx() ctx: RequestContext, @Res() res: Response) {
         if (!requireAdmin(ctx, res, false)) return;
+        // The set-up checklist is a premium feature: on the free tier it is not shown.
+        if (!GeoBlockPlugin.hasPremiumAccess()) return res.json({ items: [], complete: true, premium: false });
         const items = await this.engagement.setupItems();
-        return res.json({ items, complete: items.every(i => i.done) });
+        return res.json({ items, complete: items.every(i => i.done), premium: true });
     }
 
     /** Dashboard widget feed: tier, lifecycle notice and three 7-day figures. */
@@ -434,9 +396,20 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
         const token = headerToken.trim();
         if (!token) return { ...DEFAULTS };
 
-        const row = await this.loadChannelRow(token);
+        const row = await this.rules.load(token);
         if (!row) return { ...DEFAULTS, channelToken: token };
-        return this.buildConfig(token, row);
+        return buildConfig(token, row, GeoBlockPlugin.hasPremiumAccess());
+    }
+
+    /** Crawler exemption for a page view: the User-Agent allowlist and, with
+     *  `verifyBots`, reverse DNS for anything claiming Googlebot / Bingbot. */
+    private async crawlerExempt(ua: string, ip: string | null): Promise<boolean> {
+        const s = effectiveSettings();
+        if (!isAllowlistedBot(ua, s.botAllowlist)) return false;
+        if (!s.verifyBots) return true;
+        const claimed = claimedVerifiableBot(ua);
+        if (!claimed) return true;
+        return this.crawlerVerifier.verify(claimed, ip);
     }
 
     /**
@@ -445,8 +418,10 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
      * Logs the decision so the admin stats panel shows top blocked
      * countries.
      *
-     * Returns 200 with `{ allowed: boolean, reason, mode }` regardless —
-     * the storefront decides whether to redirect or render a banner.
+     * Returns 200 with `{ allowed: boolean, reason, mode }` — the storefront
+     * decides whether to redirect or render a banner. With `?status=1` a
+     * refusal is answered 403 (or 503 + Retry-After for business hours and
+     * maintenance) instead, for edge middleware that only looks at status.
      */
     @Get('check')
     async check(@Req() req: Request, @Res() res: Response) {
@@ -459,12 +434,12 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
             || '';
         const token = headerToken.trim();
         if (!token) return res.json({ allowed: true, reason: 'no-channel' });
-        const row = await this.loadChannelRow(token);
+        const row = await this.rules.load(token);
         if (!row) return res.json({ allowed: true, reason: 'unknown-channel' });
-        // `buildConfig` applies the tier gate (unlicensed: mode=block, no
-        // subdivisions) so `/check` and the public `/site-config` agree.
-        const cfg = this.buildConfig(token, row);
-        const licensed = GeoBlockPlugin.hasPremiumAccess();
+        const premium = GeoBlockPlugin.hasPremiumAccess();
+        // The tier gate (unlicensed: mode=block, no subdivisions) is applied in
+        // `rulesFromRow`, so `/check`, `/site-config` and the simulator agree.
+        const rules = rulesFromRow(token, row, premium);
 
         const opts = getOptions();
         const ip = getRealIp(req, opts.trustedIpHeaders);
@@ -495,94 +470,40 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
                 overrideRegion = queryRegion;
             }
         }
-        const country = overrideCountry || getResolvedCountry(req, opts.trustedCountryHeaders) || null;
-        const region = overrideRegion || getResolvedRegion(req, opts.trustedCountryHeaders) || null;
+        const located = overrideCountry ? null : locate(req, ip);
+        const country = overrideCountry || located?.country || null;
+        const region = overrideRegion || (overrideCountry ? getResolvedRegion(req, opts.trustedCountryHeaders) : located?.region) || null;
         const referer = String(req.headers.referer || '').slice(0, 2048);
-
-        const allowlist = parseList(row.ipAllowlist || '');
-        const channelId = Number(row.id) || 1;
         const ua = String(req.headers['user-agent'] || '');
+        const channelId = Number(row.id) || 1;
 
-        // 1. IP allowlist trumps everything else.
-        if (ipMatchesAny(ip, allowlist)) {
-            return res.json({ allowed: true, reason: 'ip-allowlist', mode: cfg.geoBlock.mode });
-        }
-        // 1b. SEO / social crawler allowlist. Runs before geo rules
-        //     so Googlebot etc. don't get blocked and de-index the
-        //     site silently. Configurable via `botAllowlist` plugin
-        //     option — default `'strict'` (well-known SEO + social
-        //     bots only).
-        if (isAllowlistedBot(ua, opts.botAllowlist ?? 'strict')) {
-            return res.json({ allowed: true, reason: 'bot-allowlist', mode: cfg.geoBlock.mode });
-        }
-        // 1c. Business-hours schedule (per-channel). Kicks in
-        //     regardless of country when configured. IP allowlist
-        //     + bot allowlist still bypass this — office IPs and
-        //     search crawlers should never see "closed for orders".
-        const schedule = parseJsonSafely<BusinessHoursSchedule>(row.schedule);
-        const sv = checkSchedule(schedule);
-        if (!sv.inHours && sv.action) {
-            const effectiveMode = licensed
-                ? (sv.action === 'soft' ? 'soft' : 'block')
-                : 'block';
-            void this.logEvent({
-                channelId, country, region, ip,
-                ua, url: referer,
-                decision: effectiveMode === 'soft' ? 'soft-block' : 'block',
-                reason: 'schedule',
-            });
-            return res.json({
-                allowed: false,
-                reason: 'schedule',
-                mode: effectiveMode,
-                message: sv.message,
-                redirectUrl: cfg.geoBlock.blockRedirectUrl,
-                logoUrl: cfg.geoBlock.blockLogoUrl,
-            });
-        }
-        // 2. Scheduled maintenance window.
-        if (opts.maintenanceWindow && inWindow(opts.maintenanceWindow) && !ipMatchesAny(ip, opts.maintenanceWindow.allowedIps || [])) {
-            void this.logEvent({
-                channelId, country, region, ip,
-                ua: req.headers['user-agent'] as string,
-                url: referer,
-                decision: cfg.geoBlock.mode === 'soft' ? 'soft-block' : 'block',
-                reason: 'maintenance',
-            });
-            return res.json({
-                allowed: false,
-                reason: 'maintenance',
-                mode: cfg.geoBlock.mode,
-                message: cfg.geoBlock.blockMessage || 'The site is temporarily unavailable. Please try again later.',
-                redirectUrl: cfg.geoBlock.blockRedirectUrl,
-            });
-        }
-        // 3. Channel rules.
-        const verdict = isAllowed(country, region, {
-            enabled: cfg.geoBlock.enabled,
-            allowedCountries: cfg.geoBlock.allowedCountries,
-            blockedCountries: cfg.geoBlock.blockedCountries,
-            allowedGbRegions: cfg.geoBlock.allowedGbRegions,
-            allowedSubdivisions: cfg.geoBlock.allowedSubdivisions,
+        // The crawler exemption is only worked out (DNS included) when the
+        // IP allowlist has not already let the visitor through.
+        const isCrawler = ipMatchesAny(ip, rules.ipAllowlist) ? false : await this.crawlerExempt(ua, ip);
+        const v = decide(rules, { ip, country, region, isCrawler }, {
+            premium, purpose: 'view', globalMaintenance: opts.maintenanceWindow ?? null,
         });
-        if (!verdict.allowed) {
-            void this.logEvent({
-                channelId, country, region, ip,
-                ua: req.headers['user-agent'] as string,
-                url: referer,
-                decision: cfg.geoBlock.mode === 'soft' ? 'soft-block' : 'block',
-                reason: verdict.reason,
-            });
-            return res.json({
-                allowed: false,
-                reason: verdict.reason,
-                mode: cfg.geoBlock.mode,
-                message: cfg.geoBlock.blockMessage || this.defaultMessage(verdict.reason),
-                redirectUrl: cfg.geoBlock.blockRedirectUrl,
-                logoUrl: cfg.geoBlock.blockLogoUrl,
-            });
+        if (v.allowed) return res.json({ allowed: true, reason: v.reason, mode: v.mode });
+
+        void this.logEvent({
+            channelId, country, region, ip, ua, url: referer,
+            decision: v.mode === 'soft' ? 'soft-block' : 'block',
+            reason: v.reason,
+        });
+        const body: Record<string, any> = {
+            allowed: false,
+            reason: v.reason,
+            mode: v.mode,
+            message: v.message,
+            redirectUrl: v.redirectUrl ?? null,
+        };
+        if (v.reason !== 'maintenance' || v.logoUrl) body.logoUrl = v.logoUrl ?? null;
+        if (String(req.query.status || '') === '1' && v.mode === 'block') {
+            const status = httpStatusFor(v.reason);
+            if (status === 503) res.setHeader('Retry-After', String(v.retryAfterSec ?? 3600));
+            res.status(status);
         }
-        return res.json({ allowed: true, reason: verdict.reason, mode: cfg.geoBlock.mode });
+        return res.json(body);
     }
 
     /** Catalogue of available region presets — fed to the admin picker
@@ -653,7 +574,10 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
                     \`customFieldsGeoblockipallowlist\`                AS ipAllowlist,
                     \`customFieldsGeoblockblockmessage\`               AS blockMessage,
                     \`customFieldsGeoblockblockredirecturl\`           AS blockRedirectUrl,
-                    \`customFieldsGeoblockblocklogourl\`               AS blockLogoUrl
+                    \`customFieldsGeoblockblocklogourl\`               AS blockLogoUrl,
+                    \`customFieldsGeoblockschedule\`                   AS schedule,
+                    \`customFieldsGeoblockmaintenance\`                AS maintenance,
+                    \`customFieldsGeoblockenforcepurchases\`           AS enforcePurchases
              FROM channel
              ORDER BY id`,
         );
@@ -668,6 +592,7 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
                 extraAllowed,
                 blocked: blockedCountries,
             });
+            const maintenance = parseMaintenance(r.maintenance);
             return {
                 id: r.id,
                 code: r.code,
@@ -683,6 +608,10 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
                 blockMessage: r.blockMessage || '',
                 blockRedirectUrl: r.blockRedirectUrl || '',
                 blockLogoUrl: r.blockLogoUrl || '',
+                schedule: parseJsonSafely<BusinessHoursSchedule>(r.schedule),
+                maintenance,
+                maintenanceActive: inWindow(maintenance),
+                enforcePurchases: !!Number(r.enforcePurchases || 0),
                 resolved: { allowedCountries: resolved.allowed, blockedCountries: resolved.blocked },
             };
         });
@@ -697,30 +626,32 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
         }
         // The body names the channel: the caller must hold UpdateCatalog in THAT channel,
         // not just in the one its vendure-token header selects.
-        if (!channelPermitted(ctx, { token: body.token }, [Permission.UpdateCatalog])
-            || !(await this.loadChannelRowUncached(body.token))) {
+        const existing = channelPermitted(ctx, { token: body.token }, [Permission.UpdateCatalog])
+            ? await this.rules.loadUncached(body.token) : null;
+        if (!existing) {
             return res.status(404).json({ error: 'channel not found' });
         }
         // Validate what goes into the TEXT columns: bounded lists of known
         // codes, parseable IPs/CIDRs (no /0 footgun), http(s) URLs only —
         // a `javascript:` redirect would run in the storefront helper.
         const rejected: string[] = [];
-        const normList = (v: any, valid?: (x: string) => boolean): string => {
-            if (!Array.isArray(v)) return '[]';
+        const lockedPresets: string[] = [];
+        const premium = GeoBlockPlugin.hasPremiumAccess();
+        const savedPresets = new Set(parseList(existing.allowedRegions).map(x => String(x).toUpperCase()));
+        const cleanList = (v: any, valid?: (x: string) => boolean): string[] => {
+            if (!Array.isArray(v)) return [];
             const clean = v.filter(x => typeof x === 'string').map(x => x.trim().toUpperCase()).filter(Boolean).slice(0, 500);
             const kept = valid ? clean.filter(x => { const ok = valid(x); if (!ok) rejected.push(x); return ok; }) : clean;
-            return JSON.stringify(Array.from(new Set(kept)));
+            return Array.from(new Set(kept));
         };
         const isCountry = (x: string) => /^[A-Z]{2}$/.test(x);
-        const isPreset = (x: string) => x === 'WORLDWIDE' || REGION_PRESETS.some(p => String(p.key).toUpperCase() === x);
-        const isIpOrCidr = (x: string) => {
-            const [base, bits] = x.split('/');
-            const v4 = /^\d{1,3}(\.\d{1,3}){3}$/.test(base) && base.split('.').every(o => Number(o) <= 255);
-            const v6 = /^[0-9a-f:]+$/i.test(base) && base.includes(':');
-            if (!v4 && !v6) return false;
-            if (bits === undefined) return true;
-            const n = Number(bits);
-            return Number.isInteger(n) && n >= 8 && n <= (v4 ? 32 : 128);
+        // Free tier: 5 of the 37 presets. Enforced here, not only in the UI —
+        // presets already saved (while licensed) are kept, new ones refused.
+        const isPreset = (x: string) => {
+            const known = x === 'WORLDWIDE' || REGION_PRESETS.some(p => String(p.key).toUpperCase() === x);
+            if (!known) return false;
+            if (!premium && !isFreeTierPreset(x) && !savedPresets.has(x)) { lockedPresets.push(x); return false; }
+            return true;
         };
         const normIpList = (v: any): string => {
             if (!Array.isArray(v)) return '[]';
@@ -748,37 +679,156 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
             }
             return JSON.stringify(out);
         };
+        // Business hours and the channel's maintenance window: only touched when sent.
+        let scheduleJson: string | null | undefined;
+        let maintenanceJson: string | null | undefined;
+        try {
+            if (body.schedule !== undefined) {
+                const sch = sanitiseSchedule(body.schedule);
+                scheduleJson = sch ? JSON.stringify(sch) : null;
+            }
+            if (body.maintenance !== undefined) {
+                const m = sanitiseMaintenance(body.maintenance, isIpOrCidr);
+                maintenanceJson = m ? JSON.stringify(m) : null;
+            }
+        } catch (e: any) {
+            return res.status(400).json({ error: e?.message || 'Invalid schedule or maintenance window' });
+        }
+        const regions = cleanList(body.allowedRegions, isPreset);
+        const extra = cleanList(body.extraAllowed, isCountry);
+        const blocked = cleanList(body.blockedCountries, isCountry);
+        // Lockout refusal: rules that would block EVERY visitor are saved but
+        // left switched off, so a slip cannot take the whole store down.
+        let enabled = !!body.enabled;
+        const resolved = resolveAllowedCountries({ regions, extraAllowed: extra, blocked });
+        const lockout = enabled && resolved.allowed !== null && resolved.allowed.length === 0;
+        if (lockout) enabled = false;
+
+        const set = [
+            '`customFieldsGeoblockenabled` = ?',
+            '`customFieldsGeoblockmode` = ?',
+            '`customFieldsGeoblockallowedregions` = ?',
+            '`customFieldsGeoblockallowedcountries` = ?',
+            '`customFieldsGeoblockblockedcountries` = ?',
+            '`customFieldsGeoblockallowedgbregions` = ?',
+            '`customFieldsGeoblockallowedsubdivisions` = ?',
+            '`customFieldsGeoblockipallowlist` = ?',
+            '`customFieldsGeoblockblockmessage` = ?',
+            '`customFieldsGeoblockblockredirecturl` = ?',
+            '`customFieldsGeoblockblocklogourl` = ?',
+        ];
+        const params: any[] = [
+            enabled,
+            mode,
+            JSON.stringify(regions),
+            JSON.stringify(extra),
+            JSON.stringify(blocked),
+            JSON.stringify(cleanList(body.allowedGbRegions)),
+            normSubdivisions(body.allowedSubdivisions),
+            normIpList(body.ipAllowlist),
+            String(body.blockMessage || '').slice(0, 4000),
+            httpUrl(body.blockRedirectUrl),
+            httpUrl(body.blockLogoUrl),
+        ];
+        if (scheduleJson !== undefined) { set.push('`customFieldsGeoblockschedule` = ?'); params.push(scheduleJson); }
+        if (maintenanceJson !== undefined) { set.push('`customFieldsGeoblockmaintenance` = ?'); params.push(maintenanceJson); }
+        if (typeof body.enforcePurchases === 'boolean') { set.push('`customFieldsGeoblockenforcepurchases` = ?'); params.push(body.enforcePurchases); }
         await adapterFor(this.connection.rawConnection).query(
-            `UPDATE channel
-             SET \`customFieldsGeoblockenabled\` = ?,
-                 \`customFieldsGeoblockmode\` = ?,
-                 \`customFieldsGeoblockallowedregions\` = ?,
-                 \`customFieldsGeoblockallowedcountries\` = ?,
-                 \`customFieldsGeoblockblockedcountries\` = ?,
-                 \`customFieldsGeoblockallowedgbregions\` = ?,
-                 \`customFieldsGeoblockallowedsubdivisions\` = ?,
-                 \`customFieldsGeoblockipallowlist\` = ?,
-                 \`customFieldsGeoblockblockmessage\` = ?,
-                 \`customFieldsGeoblockblockredirecturl\` = ?,
-                 \`customFieldsGeoblockblocklogourl\` = ?
-             WHERE token = ?`,
-            [
-                !!body.enabled,
-                mode,
-                normList(body.allowedRegions, isPreset),
-                normList(body.extraAllowed, isCountry),
-                normList(body.blockedCountries, isCountry),
-                normList(body.allowedGbRegions),
-                normSubdivisions(body.allowedSubdivisions),
-                normIpList(body.ipAllowlist),
-                String(body.blockMessage || '').slice(0, 4000),
-                httpUrl(body.blockRedirectUrl),
-                httpUrl(body.blockLogoUrl),
-                body.token,
-            ],
+            `UPDATE channel SET ${set.join(', ')} WHERE token = ?`,
+            [...params, body.token],
         );
-        this.rowCache.delete(String(body.token));
-        return res.json({ ok: true, rejected });
+        this.rules.invalidate(String(body.token));
+        return res.json({
+            ok: true,
+            rejected,
+            lockedPresets,
+            lockout,
+            ...(lockout ? { message: 'Nothing would be allowed, so the rules were saved but left switched off. Pick a region or country first.' } : {}),
+        });
+    }
+
+    /** "Add my IP": puts the calling administrator's own address on the
+     *  channel's IP allowlist (the address the plugin sees, after the
+     *  trusted-proxy rules — exactly what `/check` would compare). */
+    @Post('admin/add-my-ip')
+    async addMyIp(@Ctx() ctx: RequestContext, @Req() req: Request, @Body() body: any, @Res() res: Response) {
+        if (!requireAdmin(ctx, res, true)) return;
+        const token = typeof body?.token === 'string' ? body.token : '';
+        const row = token && channelPermitted(ctx, { token }, [Permission.UpdateCatalog]) ? await this.rules.loadUncached(token) : null;
+        if (!row) return res.status(404).json({ error: 'channel not found' });
+        const ip = getRealIp(req, getOptions().trustedIpHeaders);
+        if (!ip || !isIpOrCidr(ip)) return res.status(400).json({ error: 'Could not work out your IP address' });
+        const list = parseList(row.ipAllowlist);
+        if (ipMatchesAny(ip, list)) return res.json({ ok: true, ip, added: false, ipAllowlist: list });
+        if (list.length >= 500) return res.status(400).json({ error: 'The IP allowlist is full (500 entries)' });
+        const next = [...list, ip];
+        await adapterFor(this.connection.rawConnection).query(
+            `UPDATE channel SET \`customFieldsGeoblockipallowlist\` = ? WHERE token = ?`,
+            [JSON.stringify(next), token],
+        );
+        this.rules.invalidate(token);
+        return res.json({ ok: true, ip, added: true, ipAllowlist: next });
+    }
+
+    /** Country-source diagnostic: the caller's own IP, the country it
+     *  resolves to and where that came from (CDN header, local MaxMind file
+     *  or nothing), plus why when nothing works. */
+    @Get('admin/diagnostic')
+    async diagnostic(@Ctx() ctx: RequestContext, @Req() req: Request, @Res() res: Response) {
+        if (!requireAdmin(ctx, res, false)) return;
+        res.setHeader('Cache-Control', 'no-store');
+        const d = diagnose(req);
+        const ua = String(req.headers['user-agent'] || '');
+        return res.json({ ...d, crawlerExempt: await this.crawlerExempt(ua, d.ip) });
+    }
+
+    /** Settings: init options are the defaults; the safe subset can be
+     *  overridden here (stored in the plugin prefs). Security options are
+     *  returned read-only. */
+    @Get('admin/settings')
+    async getSettings(@Ctx() ctx: RequestContext, @Res() res: Response) {
+        if (!requireAdmin(ctx, res, false)) return;
+        await refreshOverrides(this.engagement.prefs, true);
+        return res.json(this.settingsView());
+    }
+
+    @Post('admin/settings')
+    async saveSettings(@Ctx() ctx: RequestContext, @Body() body: any, @Res() res: Response) {
+        // Install-wide: affects every channel.
+        if (!requireAdmin(ctx, res, 'super')) return;
+        await refreshOverrides(this.engagement.prefs, true);
+        let next;
+        try {
+            next = sanitiseOverrides(getOverrides(), body || {});
+        } catch (e: any) {
+            return res.status(400).json({ error: e?.message || 'Invalid settings' });
+        }
+        await saveOverrides(this.engagement.prefs, next);
+        this.ensureLimiter();
+        return res.json(this.settingsView());
+    }
+
+    private settingsView() {
+        const o = getOptions();
+        const eff = effectiveSettings();
+        return {
+            effective: {
+                botMode: eff.botMode, botCustom: eff.botCustom, verifyBots: eff.verifyBots,
+                supportEmail: eff.supportEmail, rateLimitPerMinute: Math.round(eff.rateLimit.capacity * 60_000 / eff.rateLimit.windowMs),
+                hashAuditIps: eff.hashAuditIps, storefrontHelperMaxAgeSec: eff.storefrontHelperMaxAgeSec,
+            },
+            overrides: getOverrides(),
+            readOnly: {
+                publicBaseUrl: o.publicBaseUrl || '',
+                trustedIpHeaders: o.trustedIpHeaders || [],
+                trustedCountryHeaders: o.trustedCountryHeaders ?? 'default (CDN headers via a trusted proxy)',
+                signingSecret: !!o.signingSecret,
+                ipSalt: !!o.ipSalt,
+                maxmindDb: o.maxmindDbPath ? (o.maxmindDbPath.split(/[\\/]/).pop() || '') : null,
+                retention: o.retention === false ? 'off' : (o.retention || { days: 90, maxRows: 500000 }),
+                maintenanceWindow: o.maintenanceWindow ? { startsAt: o.maintenanceWindow.startsAt, endsAt: o.maintenanceWindow.endsAt } : null,
+            },
+        };
     }
 
     /**
@@ -853,30 +903,35 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
             return res.status(402).json(premiumFeatureError('vendure-plugin-geo-block'));
         }
         if (!body?.token || typeof body.token !== 'string') return res.status(400).json({ error: 'channel token required' });
-        const row = channelPermitted(ctx, { token: body.token }, [Permission.ReadCatalog]) ? await this.loadChannelRow(body.token) : null;
+        const row = channelPermitted(ctx, { token: body.token }, [Permission.ReadCatalog]) ? await this.rules.load(body.token) : null;
         if (!row) return res.status(404).json({ error: 'channel not found' });
-        const cfg = this.buildConfig(body.token, row);
-        const verdict = isAllowed(body.country || null, body.region || null, {
-            enabled: cfg.geoBlock.enabled,
-            allowedCountries: cfg.geoBlock.allowedCountries,
-            blockedCountries: cfg.geoBlock.blockedCountries,
-            allowedGbRegions: cfg.geoBlock.allowedGbRegions,
-            allowedSubdivisions: cfg.geoBlock.allowedSubdivisions,
-        });
+        const cfg = buildConfig(body.token, row, GeoBlockPlugin.hasPremiumAccess());
+        const rules = rulesFromRow(body.token, row, GeoBlockPlugin.hasPremiumAccess());
+        const country = typeof body.country === 'string' && /^[A-Za-z]{2}$/.test(body.country) ? body.country.toUpperCase() : null;
+        const region = typeof body.region === 'string' && /^[A-Za-z0-9]{1,4}$/.test(body.region) ? body.region.toUpperCase() : null;
+        const ip = normaliseIp(typeof body.ip === 'string' ? body.ip : null);
+        const verdict = isAllowed(country, region, rules);
         const opts = getOptions();
-        const sv = checkSchedule(parseJsonSafely<BusinessHoursSchedule>(row.schedule));
+        const s = effectiveSettings();
+        const ua = typeof body.userAgent === 'string' ? body.userAgent.slice(0, 500) : '';
+        const isBot = ua ? isAllowlistedBot(ua, s.botAllowlist) : null;
+        const now = new Date();
+        const decision = decide(rules, { ip, country, region, isCrawler: !!isBot }, { premium: true, purpose: 'view', globalMaintenance: opts.maintenanceWindow ?? null, now });
+        const purchase = decide(rules, { ip, country, region, isCrawler: false }, { premium: true, purpose: 'purchase', globalMaintenance: opts.maintenanceWindow ?? null, now });
+        const sv = checkSchedule(rules.schedule, now);
         void this.engagement.markSimulated();
         return res.json({
-            input: {
-                country: body.country || null,
-                region: body.region || null,
-                ip: body.ip || null,
-            },
+            input: { country, region, ip: ip || null },
             verdict,
-            ipMatchesAllowlist: ipMatchesAny(normaliseIp(body.ip), parseList(row.ipAllowlist || '')),
-            bot: body.userAgent ? isAllowlistedBot(String(body.userAgent), opts.botAllowlist ?? 'strict') : null,
-            schedule: { inHours: sv.inHours, action: sv.action },
-            maintenance: !!(opts.maintenanceWindow && inWindow(opts.maintenanceWindow)),
+            // The whole pipeline (allowlist → crawler → hours → maintenance → rules) for a page view…
+            decision,
+            // …and for a purchase, when server-side enforcement is on (crawlers get no exemption; soft = banner only).
+            purchase: { refused: !purchase.allowed && purchase.mode === 'block', reason: purchase.reason, enforced: !!Number(row.enforcePurchases || 0) },
+            ipMatchesAllowlist: ipMatchesAny(ip, rules.ipAllowlist),
+            bot: isBot,
+            botNeedsDnsCheck: !!(isBot && s.verifyBots && claimedVerifiableBot(ua)),
+            schedule: { inHours: sv.inHours, action: sv.action, localTime: sv.localTime, localDay: sv.localDay },
+            maintenance: !!(opts.maintenanceWindow && inWindow(opts.maintenanceWindow, now)) || inWindow(rules.maintenance, now),
             effectiveRules: cfg.geoBlock,
         });
     }
@@ -912,7 +967,7 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
     huloGeoJs(@Res() res: Response) {
         const opts = getOptions();
         const body = buildHuloGeoJs({ publicBaseUrl: opts.publicBaseUrl || '' });
-        const maxAge = Math.max(60, opts.storefrontHelperMaxAgeSec ?? 300);
+        const maxAge = effectiveSettings().storefrontHelperMaxAgeSec;
         res.type('application/javascript');
         res.setHeader('Cache-Control', `public, max-age=${maxAge}, stale-while-revalidate=${maxAge * 4}`);
         applySecurityHeaders(res);
@@ -945,11 +1000,17 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
         let logoUrl: string | null = null;
         let redirectUrl: string | null = null;
         let msg = '';
+        let retryAfterSec = 3600;
         if (token) {
-            const row = await this.loadChannelRow(token);
+            const row = await this.rules.load(token);
             if (row) {
                 logoUrl = row.blockLogoUrl || null;
                 redirectUrl = row.blockRedirectUrl || null;
+                if (reason === 'maintenance') {
+                    const m = parseMaintenance(row.maintenance);
+                    if (m?.message && inWindow(m)) msg = String(m.message).slice(0, 400);
+                    if (m && inWindow(m)) retryAfterSec = Math.max(60, Math.min(86_400, Math.ceil((Date.parse(m.endsAt) - Date.now()) / 1000)));
+                }
                 if (reason === 'schedule') {
                     const sched = parseJsonSafely<BusinessHoursSchedule>(row.schedule);
                     msg = String(sched?.outsideMessage || checkSchedule(sched).message || '').slice(0, 400);
@@ -957,7 +1018,7 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
                 if (!msg && row.blockMessage) msg = String(row.blockMessage).slice(0, 400);
             }
         }
-        if (!msg) msg = this.defaultMessage(reason as any);
+        if (!msg) msg = defaultMessage(reason);
 
         const wantsJson = String(req.headers.accept || '').includes('application/json');
         if (wantsJson) {
@@ -966,14 +1027,21 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
 
         const html = buildBlockedPageHtml({
             title: 'Not available in your region',
-            heading: reason === 'schedule' ? 'Sorry, we’re closed' : 'Sorry, this store is not available',
+            heading: reason === 'schedule' ? 'Sorry, we’re closed' : (reason === 'maintenance' ? 'Back soon' : 'Sorry, this store is not available'),
             message: escapeHtml(msg),
             reason: escapeHtml(reason),
             country: country ? escapeHtml(country) : null,
             logoUrl: logoUrl ? escapeHtml(logoUrl) : null,
             redirectUrl: redirectUrl ? escapeHtml(redirectUrl) : null,
-            supportEmail: opts.supportEmail ? escapeHtml(opts.supportEmail) : null,
+            supportEmail: effectiveSettings().supportEmail ? escapeHtml(effectiveSettings().supportEmail) : null,
         });
+        // The HTML block page is not content: 403 for a geo refusal, 503 with
+        // Retry-After while closed (business hours) or in maintenance, so
+        // crawlers and caches never store it as the page.
+        const status = httpStatusFor(reason);
+        if (status === 503) res.setHeader('Retry-After', String(retryAfterSec));
+        res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+        res.status(status);
         res.type('text/html');
         res.setHeader('Cache-Control', 'no-store');
         return res.send(html);
@@ -981,101 +1049,13 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
 
     // -- private helpers ---------------------------------------------------
 
-    private async loadChannelRow(token: string): Promise<any | null> {
-        const hit = this.rowCache.get(token);
-        if (hit && hit.exp > Date.now()) return hit.row;
-        const row = await this.loadChannelRowUncached(token);
-        if (this.rowCache.size > 200) this.rowCache.clear();
-        this.rowCache.set(token, { row, exp: Date.now() + GeoBlockController.ROW_TTL_MS });
-        return row;
-    }
-
-    /** `companyData` comes from Channel custom fields the HOST may define
-     *  (`showCompanyNumber`, `businessCompanyNumber`); this plugin does not
-     *  register them, so they are only selected when they exist — selecting
-     *  them unconditionally made every per-channel call fail elsewhere. */
-    private companyCols: string | null = null;
-    private companyColumns(): string {
-        if (this.companyCols !== null) return this.companyCols;
-        let cols = '';
-        try {
-            const meta = this.connection.rawConnection.getMetadata(Channel);
-            const show = meta.findColumnWithPropertyPath('customFields.showCompanyNumber');
-            const num = meta.findColumnWithPropertyPath('customFields.businessCompanyNumber');
-            if (show) cols += `\`${show.databaseName}\` AS showCompanyNumber,\n`;
-            if (num) cols += `\`${num.databaseName}\` AS companyNumber,\n`;
-        } catch { cols = ''; }
-        this.companyCols = cols;
-        return cols;
-    }
-
-    private async loadChannelRowUncached(token: string): Promise<any | null> {
-        const rows = await adapterFor(this.connection.rawConnection).query(
-            `SELECT id, token,
-                    ${this.companyColumns()}
-                    \`customFieldsGeoblockenabled\`             AS geoBlockEnabled,
-                    \`customFieldsGeoblockmode\`                AS geoBlockMode,
-                    \`customFieldsGeoblockallowedregions\`      AS allowedRegions,
-                    \`customFieldsGeoblockallowedcountries\`    AS extraAllowed,
-                    \`customFieldsGeoblockblockedcountries\`    AS blockedCountries,
-                    \`customFieldsGeoblockallowedgbregions\`    AS allowedGbRegions,
-                    \`customFieldsGeoblockallowedsubdivisions\` AS allowedSubdivisionsJson,
-                    \`customFieldsGeoblockipallowlist\`         AS ipAllowlist,
-                    \`customFieldsGeoblockblockmessage\`        AS blockMessage,
-                    \`customFieldsGeoblockblockredirecturl\`    AS blockRedirectUrl,
-                    \`customFieldsGeoblockblocklogourl\`        AS blockLogoUrl,
-                    \`customFieldsGeoblockschedule\`            AS schedule
-             FROM channel WHERE token = ? LIMIT 1`,
-            [token],
-        );
-        return rows[0] || null;
-    }
-
-    /** Rules for one channel as the storefront and `/check` see them.
-     *  Tier gate: unlicensed installs (evaluation expired) force
-     *  `mode=block` (no soft-block banner) and ignore the saved
-     *  subdivision map. The block decision itself still runs so the free
-     *  tier is genuinely useful — just narrower. Applied here so the
-     *  public `/site-config`, `/check` and the simulator never disagree. */
-    private buildConfig(token: string, r: any): SiteConfig {
-        const allowedRegions = parseList(r.allowedRegions);
-        const extraAllowed = parseList(r.extraAllowed, ['GB']);
-        const blockedCountries = parseList(r.blockedCountries);
-        const resolved = resolveAllowedCountries({
-            regions: allowedRegions,
-            extraAllowed,
-            blocked: blockedCountries,
-        });
-        const licensed = GeoBlockPlugin.hasPremiumAccess();
-        return {
-            channelToken: token,
-            geoBlock: {
-                enabled: !!Number(r.geoBlockEnabled || 0),
-                mode: (licensed && r.geoBlockMode === 'soft' ? 'soft' : 'block'),
-                allowedCountries: resolved.allowed,
-                blockedCountries: resolved.blocked,
-                // No default UK regions — hidden unless explicitly configured.
-                allowedGbRegions: parseList(r.allowedGbRegions, []),
-                allowedSubdivisions: licensed ? parseSubdivisions(r.allowedSubdivisionsJson) : {},
-                allowedRegions,
-                blockMessage: String(r.blockMessage || ''),
-                blockRedirectUrl: r.blockRedirectUrl || null,
-                blockLogoUrl: r.blockLogoUrl || null,
-            },
-            companyData: {
-                showCompanyNumber: !!Number(r.showCompanyNumber || 0),
-                companyNumber: String(r.companyNumber || ''),
-            },
-        };
-    }
-
     /** Apply IP hashing when the plugin is configured to anonymise audit
      *  rows. Default is to hash, with the configured `ipSalt`, else the
      *  generated per-install salt, else (store unavailable) the legacy constant. */
     private maybeHashIp(ip: string | null): any {
         if (!ip) return null;
         const opts = getOptions();
-        if (opts.hashAuditIps === false) return ip.slice(0, 64);
+        if (!effectiveSettings().hashAuditIps) return ip.slice(0, 64);
         return hashIp(ip, opts.ipSalt || generatedIpSalt || LEGACY_IP_SALT);
     }
 
@@ -1110,27 +1090,4 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
             Logger.warn(`geo-block event log failed: ${e?.message}`, loggerCtx);
         }
     }
-
-    private defaultMessage(reason: string): string {
-        switch (reason) {
-            case 'denylist':
-                return 'This service is not available in your country.';
-            case 'country-not-allowed':
-                return 'This service is not available in your country.';
-            case 'uk-region-not-allowed':
-                return 'This service is only available in selected UK regions.';
-            case 'maintenance':
-                return 'The site is temporarily unavailable. Please try again later.';
-            default:
-                return 'Access denied.';
-        }
-    }
-}
-
-function inWindow(w: { startsAt: string; endsAt: string; allowedIps?: string[] }): boolean {
-    const now = Date.now();
-    const start = Date.parse(w.startsAt);
-    const end = Date.parse(w.endsAt);
-    if (!isFinite(start) || !isFinite(end)) return false;
-    return now >= start && now <= end;
 }

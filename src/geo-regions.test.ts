@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ipMatchesAny } from './geo-regions';
+import { ipMatchesAny, isFreeTierPreset, isIpOrCidr, parseIp } from './geo-regions';
 import { getRealIp, normaliseIp } from './proxy-headers';
 import { checkSchedule } from './schedule';
 
@@ -38,5 +38,43 @@ describe('checkSchedule normalisation', () => {
         const midnight = new Date('2026-09-28T23:30:00Z'); // 00:30 BST Tuesday
         const r = checkSchedule({ ...s, days: ['2'], from: '00:00', to: '01:00' }, midnight);
         expect(r.localTime && r.localTime.startsWith('24')).toBe(false);
+    });
+});
+
+describe('ipMatchesAny — IPv6 and CIDR (B4)', () => {
+    it('matches IPv6 CIDR ranges, which used to be string-compared and never matched', () => {
+        expect(ipMatchesAny('2001:db8:abcd:12::1', ['2001:db8:abcd::/48'])).toBe(true);
+        expect(ipMatchesAny('2001:db8:abce::1', ['2001:db8:abcd::/48'])).toBe(false);
+        expect(ipMatchesAny('2001:0DB8:0000:0000:0000:0000:0000:0001', ['2001:db8::1'])).toBe(true);
+        expect(ipMatchesAny('2001:db8::1', ['2001:db8:0:0::/64'])).toBe(true);
+        expect(ipMatchesAny('fe80::1%eth0', ['fe80::/10'])).toBe(true);
+        expect(ipMatchesAny('2001:db8::1', ['2001:db8::/129'])).toBe(false);
+    });
+    it('keeps IPv4 CIDR and IPv4-mapped behaviour', () => {
+        expect(ipMatchesAny('203.0.113.77', ['203.0.113.0/24'])).toBe(true);
+        expect(ipMatchesAny('::ffff:203.0.113.77', ['203.0.113.0/24'])).toBe(true);
+        expect(ipMatchesAny('203.0.113.77', ['::ffff:203.0.113.0/120'])).toBe(true);
+        expect(ipMatchesAny('198.51.100.1', ['203.0.113.0/24'])).toBe(false);
+        expect(ipMatchesAny('203.0.113.77', ['2001:db8::/32'])).toBe(false);
+        expect(ipMatchesAny('not-an-ip', ['0.0.0.0/8'])).toBe(false);
+    });
+    it('parses IPv6 forms', () => {
+        expect(Array.from(parseIp('::1')!)).toEqual([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        expect(parseIp('1:2:3:4:5:6:7:8:9')).toBeNull();
+        expect(parseIp('1::2::3')).toBeNull();
+        expect(Array.from(parseIp('::ffff:c000:20a')!)).toEqual([192, 0, 2, 10]);
+        expect(parseIp('64:ff9b::192.0.2.1')!.length).toBe(16);
+    });
+    it('isIpOrCidr refuses wide or malformed ranges', () => {
+        expect(isIpOrCidr('2001:db8::/32')).toBe(true);
+        expect(isIpOrCidr('203.0.113.0/24')).toBe(true);
+        expect(isIpOrCidr('0.0.0.0/0')).toBe(false);
+        expect(isIpOrCidr('::/0')).toBe(false);
+        expect(isIpOrCidr('203.0.113.0/33')).toBe(false);
+        expect(isIpOrCidr('banana')).toBe(false);
+    });
+    it('free-tier presets', () => {
+        expect(isFreeTierPreset('EU')).toBe(true);
+        expect(isFreeTierPreset('gcc')).toBe(false);
     });
 });

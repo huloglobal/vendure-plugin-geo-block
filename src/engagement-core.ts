@@ -16,6 +16,7 @@ export const PREMIUM_FEATURES: string[] = [
     'Soft-block (show a notice instead of a wall)',
     'Audit log and blocked-traffic stats',
     'Simulate rules before going live',
+    'Weekly e-mail report and set-up checklist',
 ];
 
 

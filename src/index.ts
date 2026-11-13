@@ -16,5 +16,10 @@ export {
     resolveAllowedCountries,
     isAllowed,
     ipMatchesAny,
+    isIpOrCidr,
+    parseIp,
 } from './geo-regions';
+export { decide, Verdict, Visitor, Purpose, ChannelMaintenance } from './decision';
+export { MmdbReader, LocalCountryDb } from './mmdb';
+export { GeoBlockChannelFields1763020800000 } from './migration';
 export { GeoBlockEvent } from './geo-block-event.entity';

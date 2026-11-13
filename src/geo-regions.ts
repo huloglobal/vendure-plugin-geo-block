@@ -311,42 +311,114 @@ export function isAllowed(
     return { allowed: true, reason: 'ok' };
 }
 
-/** Lightweight IP-in-CIDR check for the allowlist. Supports IPv4 only —
- * enough for the office IPs / payment-processor ranges that the admin
- * typically allowlists. IPv6 entries are checked as plain string match. */
+/** Parse an IPv4 or IPv6 address into its byte array (4 or 16 bytes).
+ *  `::ffff:a.b.c.d` (IPv4-mapped) is returned as the 4-byte IPv4 form so it
+ *  matches plain IPv4 entries. Returns null for anything unparseable. */
+export function parseIp(raw: string | null | undefined): Uint8Array | null {
+    let s = String(raw ?? '').trim().toLowerCase();
+    if (!s) return null;
+    if (s.startsWith('[') && s.endsWith(']')) s = s.slice(1, -1);
+    const pct = s.indexOf('%'); // zone id (fe80::1%eth0)
+    if (pct >= 0) s = s.slice(0, pct);
+    const mapped = s.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+    if (mapped) s = mapped[1];
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(s)) {
+        const parts = s.split('.').map(Number);
+        if (parts.some(o => !Number.isInteger(o) || o < 0 || o > 255)) return null;
+        return Uint8Array.from(parts);
+    }
+    if (!s.includes(':') || !/^[0-9a-f:.]+$/.test(s)) return null;
+    // An embedded IPv4 tail (::1.2.3.4, 64:ff9b::1.2.3.4) becomes two hextets.
+    let tail: number[] = [];
+    const v4tail = s.match(/(\d{1,3}(?:\.\d{1,3}){3})$/);
+    if (v4tail) {
+        const b = parseIp(v4tail[1]);
+        if (!b || b.length !== 4) return null;
+        tail = [(b[0] << 8) | b[1], (b[2] << 8) | b[3]];
+        s = s.slice(0, -v4tail[1].length);
+        if (s.endsWith(':') && !s.endsWith('::')) s = s.slice(0, -1);
+    }
+    const halves = s.split('::');
+    if (halves.length > 2) return null;
+    const hex = (part: string): number[] | null => {
+        if (!part) return [];
+        const out: number[] = [];
+        for (const h of part.split(':')) {
+            if (!/^[0-9a-f]{1,4}$/.test(h)) return null;
+            out.push(parseInt(h, 16));
+        }
+        return out;
+    };
+    const head = hex(halves[0]);
+    const rest = halves.length === 2 ? hex(halves[1]) : [];
+    if (!head || !rest) return null;
+    const known = head.length + rest.length + tail.length;
+    let words: number[];
+    if (halves.length === 2) {
+        if (known > 7) return null;
+        words = [...head, ...new Array(8 - known).fill(0), ...rest, ...tail];
+    } else {
+        if (known !== 8) return null;
+        words = [...head, ...tail];
+    }
+    const bytes = new Uint8Array(16);
+    words.forEach((w, i) => { bytes[i * 2] = w >> 8; bytes[i * 2 + 1] = w & 0xff; });
+    // An IPv4-mapped address written in hex (::ffff:c000:20a) is IPv4 too.
+    if (bytes.slice(0, 10).every(b => b === 0) && bytes[10] === 0xff && bytes[11] === 0xff) return bytes.slice(12);
+    return bytes;
+}
+
+/** True when the first `bits` bits of `a` and `b` agree (same family). */
+function prefixMatch(a: Uint8Array, b: Uint8Array, bits: number): boolean {
+    if (a.length !== b.length || bits < 0 || bits > a.length * 8) return false;
+    const whole = Math.floor(bits / 8);
+    for (let i = 0; i < whole; i++) if (a[i] !== b[i]) return false;
+    const rem = bits % 8;
+    if (!rem) return true;
+    const mask = (0xff << (8 - rem)) & 0xff;
+    return (a[whole] & mask) === (b[whole] & mask);
+}
+
+/** IP-in-list check for the allowlists: single addresses and CIDR ranges,
+ *  IPv4 and IPv6 alike (compared as bytes, so `2001:db8::1` matches
+ *  `2001:0db8:0:0::/64`, and `::ffff:203.0.113.5` matches `203.0.113.0/24`). */
 export function ipMatchesAny(ipRaw: string | null | undefined, list: string[]): boolean {
     if (!ipRaw || !list?.length) return false;
-    // `req.ip` on a dual-stack listener is `::ffff:203.0.113.5`; compare the plain form, case-insensitively.
-    const ip = String(ipRaw).trim().replace(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i, '$1').toLowerCase();
+    const ip = parseIp(ipRaw);
+    if (!ip) return false;
     for (const entry of list) {
-        const trimmed = entry.trim().toLowerCase().replace(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i, '$1');
-        if (!trimmed) continue;
-        if (trimmed === ip) return true;
-        if (trimmed.includes('/') && ip.includes('.')) {
-            // IPv4 CIDR
-            const [base, bitsStr] = trimmed.split('/');
-            const bits = parseInt(bitsStr, 10);
-            if (isFinite(bits) && bits >= 0 && bits <= 32) {
-                const a = ipv4ToInt(ip);
-                const b = ipv4ToInt(base);
-                if (a !== null && b !== null) {
-                    const mask = bits === 0 ? 0 : (~0 << (32 - bits)) >>> 0;
-                    if ((a & mask) === (b & mask)) return true;
-                }
-            }
+        if (typeof entry !== 'string') continue;
+        const [baseRaw, bitsRaw] = entry.trim().split('/');
+        const base = parseIp(baseRaw);
+        if (!base || base.length !== ip.length) continue;
+        if (bitsRaw === undefined) {
+            if (prefixMatch(ip, base, ip.length * 8)) return true;
+            continue;
         }
+        if (!/^\d{1,3}$/.test(bitsRaw.trim())) continue;
+        // A mapped-IPv4 base written in IPv6 form carries IPv6 prefix bits (/120 → /24).
+        let bits = parseInt(bitsRaw, 10);
+        if (base.length === 4 && baseRaw.includes(':')) bits -= 96;
+        if (prefixMatch(ip, base, bits)) return true;
     }
     return false;
 }
 
-function ipv4ToInt(ip: string): number | null {
-    const parts = ip.split('.');
-    if (parts.length !== 4) return null;
-    let n = 0;
-    for (const p of parts) {
-        const o = parseInt(p, 10);
-        if (!isFinite(o) || o < 0 || o > 255) return null;
-        n = (n << 8) + o;
-    }
-    return n >>> 0;
+/** An entry the IP allowlists accept: an IPv4/IPv6 address, or a CIDR of /8
+ *  or narrower (so a typo'd `/0` cannot open everything). */
+export function isIpOrCidr(entry: string): boolean {
+    const [baseRaw, bitsRaw, extra] = String(entry || '').trim().split('/');
+    if (extra !== undefined) return false;
+    const base = parseIp(baseRaw);
+    if (!base) return false;
+    if (bitsRaw === undefined) return true;
+    if (!/^\d{1,3}$/.test(bitsRaw)) return false;
+    const n = Number(bitsRaw);
+    const max = baseRaw.includes(':') ? 128 : 32;
+    return n >= 8 && n <= max;
+}
+
+/** True for a preset an unlicensed install may pick. */
+export function isFreeTierPreset(key: string): boolean {
+    return FREE_TIER_PRESET_KEYS.includes(String(key).toUpperCase() as GeoRegionKey);
 }

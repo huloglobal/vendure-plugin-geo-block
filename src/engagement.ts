@@ -22,6 +22,7 @@ import {
     WeeklyDigest,
 } from '@huloglobal/vendure-licence-sdk';
 import { GeoBlockPlugin, getOptions } from './plugin';
+import { effectiveSettings } from './settings';
 import {
     ADMIN_ROUTE,
     adminUrlFor,
@@ -42,6 +43,23 @@ import {
 export * from './engagement-core';
 
 const loggerCtx = 'GeoBlockEngagement';
+
+/**
+ * The weekly report is a premium feature (licence or evaluation). The
+ * scheduler keeps running so the report resumes the Monday after a licence
+ * returns; while premium is off a tick sends nothing and moves no clock.
+ * Settings and history are kept.
+ */
+export class PremiumWeeklyDigest extends WeeklyDigest {
+    constructor(opts: ConstructorParameters<typeof WeeklyDigest>[0], private readonly premium: () => boolean) {
+        super(opts);
+    }
+
+    async tick(now: Date = new Date()): Promise<boolean> {
+        if (!this.premium()) return false;
+        return super.tick(now);
+    }
+}
 const DAY_MS = 86_400_000;
 const WEEK_MS = 7 * DAY_MS;
 const ZERO_STATS: GeoStats = { requestsBlocked: 0, requestsSoftBlocked: 0, uniqueIpsBlocked: 0 };
@@ -53,14 +71,14 @@ export class GeoBlockEngagementService implements OnApplicationBootstrap, OnModu
 
     constructor(private connection: TransactionalConnection, private processContext: ProcessContext) {
         this.prefs = new PluginPrefs((sql, params, opts) => this.query(sql, params, opts), SHORT_ID);
-        this.digest = new WeeklyDigest({
+        this.digest = new PremiumWeeklyDigest({
             pluginId: SHORT_ID,
             pluginName: PLUGIN_DISPLAY_NAME,
             prefs: this.prefs,
             collect: (from, to) => this.collect(from, to),
             send: (to, mail) => this.send(to, mail),
             defaultRecipient: () => this.defaultRecipient(),
-        });
+        }, () => GeoBlockPlugin.hasPremiumAccess());
     }
 
     async onApplicationBootstrap(): Promise<void> {
@@ -208,7 +226,7 @@ export class GeoBlockEngagementService implements OnApplicationBootstrap, OnModu
 
     /** Merchant address, then the licence customer, then the trial lead. */
     async defaultRecipient(): Promise<string | null> {
-        const own = String(getOptions().supportEmail || '').trim();
+        const own = String(effectiveSettings().supportEmail || '').trim();
         if (own) return own;
         const customer = describeLicence(GeoBlockPlugin.getLicenceStatus())?.customer;
         if (customer) return customer;

@@ -42,7 +42,9 @@ const DDL = [
         "customFieldsGeoblockblockmessage" TEXT,
         "customFieldsGeoblockblockredirecturl" VARCHAR(255),
         "customFieldsGeoblockblocklogourl" VARCHAR(255),
-        "customFieldsGeoblockschedule" TEXT
+        "customFieldsGeoblockschedule" TEXT,
+        "customFieldsGeoblockmaintenance" TEXT,
+        "customFieldsGeoblockenforcepurchases" BOOLEAN DEFAULT FALSE
     )`,
     `CREATE TABLE geo_block_event (
         id SERIAL PRIMARY KEY,
@@ -240,4 +242,37 @@ describe.skipIf(!PG_URL)('Postgres SQL corpus (HULO_PG_URL)', () => {
         }
         expect(failures, failures.join('\n')).toEqual([]);
     }, 60_000);
+});
+
+/** 0.15.0: the new channel columns round-trip on Postgres exactly as the
+ *  enforcement and the admin save write and read them. */
+describe.skipIf(!PG_URL)('Postgres: 0.15.0 channel columns (HULO_PG_URL)', () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { Client } = require('pg');
+    const client = new Client({ connectionString: PG_URL });
+    const adapter = createDbAdapter({ options: { type: 'postgres' }, query: async (sql: string, params?: any[]) => (await client.query(sql, params)).rows });
+    beforeAll(async () => { await client.connect(); }, 30_000);
+    afterAll(async () => { await client.end(); });
+
+    it('saves and reads maintenance, schedule and the enforcement switch', async () => {
+        await client.query('BEGIN');
+        try {
+            const maint = JSON.stringify({ startsAt: '2026-12-01T22:00:00.000Z', endsAt: '2026-12-02T01:00:00.000Z', allowedIps: ['2001:db8::/48'] });
+            await adapter.query(
+                'UPDATE channel SET `customFieldsGeoblockmaintenance` = ?, `customFieldsGeoblockenforcepurchases` = ?, `customFieldsGeoblockschedule` = ? WHERE token = ?',
+                [maint, true, null, '1'], { needAffected: true },
+            );
+            const rows = await adapter.query(
+                'SELECT `customFieldsGeoblockmaintenance` AS maintenance, `customFieldsGeoblockenforcepurchases` AS enforcePurchases, `customFieldsGeoblockschedule` AS schedule FROM channel WHERE token = ? LIMIT 1',
+                ['1'],
+            );
+            expect(rows[0].maintenance).toBe(maint);
+            expect(!!Number(rows[0].enforcePurchases) || rows[0].enforcePurchases === true).toBe(true);
+            expect(rows[0].schedule).toBeNull();
+            const other = await adapter.query('SELECT `customFieldsGeoblockenforcepurchases` AS enforcePurchases FROM channel WHERE token = ?', ['2']);
+            expect(!!other[0].enforcePurchases).toBe(false);
+        } finally {
+            await client.query('ROLLBACK');
+        }
+    });
 });

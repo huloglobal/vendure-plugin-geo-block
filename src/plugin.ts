@@ -3,7 +3,9 @@ import { fingerprintPublicKey, Heartbeat, LicenceStatus, RetentionOptions, Revoc
 import { GeoBlockEvent } from './geo-block-event.entity';
 import { GeoBlockController } from './geo-block.controller';
 import { GeoBlockAdminResolver, geoBlockAdminApiSchema } from './admin-api';
-import { REGION_PRESETS } from './geo-regions';
+import { isFreeTierPreset, REGION_PRESETS } from './geo-regions';
+import { GeoBlockChannelRules, parseList } from './channel-rules';
+import { GeoBlockOrderInterceptor, geoBlockOrderProcess } from './enforcement';
 import { GeoBlockEngagementService } from './engagement';
 import type { BotAllowlist } from './bot-detect';
 
@@ -28,11 +30,24 @@ export interface GeoBlockPluginOptions {
      *  (no soft-block banner) and subdivision rules are ignored on the public
      *  `site-config` and `check` endpoints; no audit log is written. */
     licenceKey?: string;
-    /** Optional scheduled-maintenance window. When the current time falls
-     *  inside this window the `/geo-block/check` endpoint refuses every
-     *  request (except IPs on the per-channel allowlist or this option's
-     *  own `allowedIps`). */
+    /** Optional scheduled-maintenance window for EVERY channel. When the
+     *  current time falls inside this window the `/geo-block/check` endpoint
+     *  refuses every request (except IPs on the per-channel allowlist, this
+     *  option's own `allowedIps` and allowlisted crawlers). Each channel can
+     *  also have its own window, set in the admin UI. */
     maintenanceWindow?: MaintenanceWindow;
+
+    // ── Country sources ─────────────────────────────────────────────────
+    /** Absolute path to a MaxMind-format country database on this server
+     *  (GeoLite2-Country.mmdb, GeoLite2-City.mmdb, GeoIP2-Country.mmdb, DB-IP
+     *  Lite MMDB). Used when no trusted CDN header gives the country. Read
+     *  locally only — the plugin never downloads it (keep it fresh with
+     *  MaxMind's `geoipupdate`; the file is re-read when it changes). */
+    maxmindDbPath?: string;
+    /** Visitors whose User-Agent claims Googlebot or Bingbot keep the crawler
+     *  exemption only if their IP passes a reverse + forward DNS check.
+     *  Default false; can also be switched on in the admin UI. */
+    verifyBots?: boolean;
 
     // ── Security ────────────────────────────────────────────────────────
     /** Proxy headers that may override `req.ip` for the visitor address
@@ -116,7 +131,7 @@ export function getOptions(): GeoBlockPluginOptions { return cachedOptions; }
 @VendurePlugin({
     imports: [PluginCommonModule],
     controllers: [GeoBlockController],
-    providers: [GeoBlockAdminResolver, GeoBlockEngagementService],
+    providers: [GeoBlockAdminResolver, GeoBlockEngagementService, GeoBlockChannelRules],
     entities: [GeoBlockEvent],
     compatibility: '^3.0.0',
     adminApiExtensions: {
@@ -153,6 +168,23 @@ export function getOptions(): GeoBlockPluginOptions { return cachedOptions; }
                 label: [{ languageCode: LanguageCode.en, value: 'Geo-block: allowed regions (presets)' }],
                 description: [{ languageCode: LanguageCode.en, value: 'One-click region presets. Combine with extra/blocked countries below.' }],
                 options: presetOptions,
+                // The free tier may pick 5 of the 37 presets (enforced on every save path).
+                validate: async (value: any, injector: any) => {
+                    if (GeoBlockPlugin.hasPremiumAccess() || !Array.isArray(value)) return;
+                    let locked = value.filter((v: any) => typeof v === 'string' && !isFreeTierPreset(v)).map((v: string) => v.toUpperCase());
+                    if (!locked.length) return;
+                    // Presets saved while licensed stay (a lapsed install can still edit its channels);
+                    // only NEW premium presets are refused.
+                    try {
+                        const rows = await adapterFor(injector.get(TransactionalConnection).rawConnection)
+                            .query(`SELECT \`customFieldsGeoblockallowedregions\` AS allowedRegions FROM channel`, []);
+                        const saved = new Set<string>();
+                        for (const r of rows || []) for (const k of parseList(r.allowedRegions)) saved.add(String(k).toUpperCase());
+                        locked = locked.filter((k: string) => !saved.has(k));
+                    } catch { return; /* fail open */ }
+                    if (!locked.length) return;
+                    return [{ languageCode: LanguageCode.en, value: `Region presets ${locked.join(', ')} need a Geo-block licence (free tier: Worldwide, UK only, EU, North America, Oceania). Clear them or activate a licence.` }];
+                },
             },
             {
                 name: 'geoBlockAllowedCountries', type: 'string', list: true, public: true,
@@ -181,7 +213,7 @@ export function getOptions(): GeoBlockPluginOptions { return cachedOptions; }
                 name: 'geoBlockIpAllowlist', type: 'string', list: true, public: false,
                 defaultValue: [],
                 label: [{ languageCode: LanguageCode.en, value: 'Geo-block: IP allowlist (overrides all rules)' }],
-                description: [{ languageCode: LanguageCode.en, value: 'IPs or IPv4 CIDR ranges (e.g. 203.0.113.0/24) that bypass every country / region rule. Add your office, oncall, payment-processor probes.' }],
+                description: [{ languageCode: LanguageCode.en, value: 'IPs or CIDR ranges, IPv4 or IPv6 (e.g. 203.0.113.0/24, 2001:db8::/48), that bypass every country / region rule. Add your office, oncall, payment-processor probes.' }],
             },
             {
                 name: 'geoBlockBlockMessage', type: 'text', public: true, nullable: true,
@@ -201,9 +233,27 @@ export function getOptions(): GeoBlockPluginOptions { return cachedOptions; }
             {
                 name: 'geoBlockSchedule', type: 'text', public: true, nullable: true,
                 label: [{ languageCode: LanguageCode.en, value: 'Geo-block: business-hours schedule' }],
-                description: [{ languageCode: LanguageCode.en, value: 'Optional JSON. Recurring weekly window when the store is open. Outside the window, the outsideAction (block / soft / allow) is applied. Example: {"timezone":"Europe/London","days":[1,2,3,4,5],"from":"09:00","to":"17:30","outsideAction":"soft","outsideMessage":"We\'re closed for orders overnight."}. Empty = no schedule.' }],
+                description: [{ languageCode: LanguageCode.en, value: 'Optional JSON (easier: the Business hours tab of the Geo-block page). Recurring weekly window when the store is open. Outside the window, the outsideAction (block / soft / allow) is applied. Example: {"timezone":"Europe/London","days":[1,2,3,4,5],"from":"09:00","to":"17:30","outsideAction":"soft","outsideMessage":"We\'re closed for orders overnight."}. Empty = no schedule.' }],
+            },
+            {
+                name: 'geoBlockMaintenance', type: 'text', public: false, nullable: true,
+                label: [{ languageCode: LanguageCode.en, value: 'Geo-block: maintenance window' }],
+                description: [{ languageCode: LanguageCode.en, value: 'Optional JSON, set from the Maintenance tab of the Geo-block page: {"startsAt":"2026-12-01T22:00:00Z","endsAt":"2026-12-02T01:00:00Z","allowedIps":["203.0.113.10"],"message":"Back soon"}.' }],
+            },
+            {
+                name: 'geoBlockEnforcePurchases', type: 'boolean', public: false, nullable: true, defaultValue: false,
+                label: [{ languageCode: LanguageCode.en, value: 'Geo-block: refuse purchases from blocked visitors' }],
+                description: [{ languageCode: LanguageCode.en, value: 'Off by default. When on, the server refuses adding to the order and checkout for visitors the rules fully block (a soft block stays a banner). Fails open: unknown country = allowed.' }],
             },
         ]);
+        // Server-side purchase enforcement: both hooks do nothing unless a
+        // channel switches it on (geoBlockEnforcePurchases) and fail open.
+        const oo: any = config.orderOptions;
+        if (oo) {
+            if (Array.isArray(oo.orderInterceptors)) oo.orderInterceptors.push(new GeoBlockOrderInterceptor());
+            else if (oo.orderInterceptors === undefined) oo.orderInterceptors = [new GeoBlockOrderInterceptor()];
+            if (Array.isArray(oo.process)) oo.process.push(geoBlockOrderProcess);
+        }
         return config;
     },
 })
@@ -340,7 +390,7 @@ export class GeoBlockPlugin {
             // eslint-disable-next-line no-console
             console.warn(
                 `[@huloglobal/vendure-plugin-geo-block] ${status.message}` +
-                ` — Running in FREE tier: 5 of 37 region presets, no subdivisions, no soft-block, no audit log. Buy a licence at https://elite.charity/licence/buy/${PLUGIN_ID}`,
+                ` — Running in FREE tier: rules are enforced; 5 of 37 region presets, no subdivisions, no soft-block, no audit log, simulator or weekly report. Buy a licence at https://elite.charity/licence/buy/${PLUGIN_ID}`,
             );
         }
 

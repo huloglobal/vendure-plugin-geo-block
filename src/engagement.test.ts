@@ -96,7 +96,8 @@ describe('adminUrlFor / PREMIUM_FEATURES', () => {
         expect(adminUrlFor('')).toBeNull();
         expect(adminUrlFor(undefined)).toBeNull();
     });
-    it('lists the four premium features', () => {
-        expect(PREMIUM_FEATURES).toHaveLength(4);
+    it('lists the five premium features (weekly report + checklist premium since 0.15.0)', () => {
+        expect(PREMIUM_FEATURES).toHaveLength(5);
+        expect(PREMIUM_FEATURES.join(' ')).toMatch(/Weekly e-mail report/);
     });
 });
