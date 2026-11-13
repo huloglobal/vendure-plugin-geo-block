@@ -6,7 +6,7 @@ import {
     premiumFeatureError,
     RateLimiter,
     startRetentionSweeper,
-    verifySignedValue, LicenceStore, performSelfUpdate, selfUpdateEnv, adapterFor, PurchaseClaimClient, evalInstanceId, describeLicence } from '@huloglobal/vendure-licence-sdk';
+    verifySignedValue, LicenceStore, performSelfUpdate, selfUpdateEnv, adapterFor, PurchaseClaimClient, evalInstanceId, describeLicence, isAdminApiSession } from '@huloglobal/vendure-licence-sdk';
 import { Channel, Ctx, Logger, Permission, ProcessContext, RequestContext, TransactionalConnection } from '@vendure/core';
 import { Request, Response } from 'express';
 import { GeoBlockEvent } from './geo-block-event.entity';
@@ -62,7 +62,7 @@ function requireAdmin(ctx: RequestContext, res: Response, write: boolean | 'supe
     }
     // 'super': self-update and licence changes affect the whole install.
     const needed = write === 'super' ? [Permission.SuperAdmin] : write ? [Permission.UpdateCatalog] : [Permission.ReadCatalog];
-    if (!ctx.userHasPermissions(needed)) {
+    if (!isAdminApiSession(ctx) || !ctx.userHasPermissions(needed)) {
         res.status(403).json({ error: 'Insufficient permissions' });
         return false;
     }

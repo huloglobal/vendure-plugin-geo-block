@@ -1,5 +1,5 @@
 import { startLicenceStub } from './local-licence-env';
-import { mergeConfig } from '@vendure/core';
+import { mergeConfig, RequestContextService, SessionService, TransactionalConnection, User } from '@vendure/core';
 import { createTestEnvironment, registerInitializer, SimpleGraphQLClient, SqljsInitializer, testConfig } from '@vendure/testing';
 import { gql } from 'graphql-tag';
 import type { Server } from 'http';
@@ -114,6 +114,24 @@ describe('geo-block security', () => {
         it('a channel-B admin does not see other channels (tokens, IP allowlists) over REST', async () => {
             const body = await (await rest('/geo-block/admin/channels', { token: bAdminToken, channel: B_TOKEN })).json();
             expect(body.channels.map((c: any) => c.token)).toEqual([B_TOKEN]);
+        });
+
+        it('Vendure 3.8+: an administrator\'s Shop-API session cannot use the admin REST routes', async () => {
+            // GHSA-5fpx-9m35-w745: core binds sessions to their API but leaves REST routes to plugins.
+            // A session created for the Shop API (e.g. a storefront login of a user who is also an
+            // administrator) carries the admin permissions; the REST gate must refuse it on 3.8+.
+            const connection = server.app.get(TransactionalConnection);
+            const user = await connection.rawConnection.getRepository(User).findOneOrFail({
+                where: { identifier: 'superadmin' }, relations: ['roles', 'roles.channels'],
+            });
+            const ctx = await server.app.get(RequestContextService).create({ apiType: 'shop' });
+            const session = await (server.app.get(SessionService) as any)
+                .createNewAuthenticatedSession(ctx, user, 'native', undefined, 'shop');
+            const sessionsHaveApiType = Number(require('@vendure/core/package.json').version.split('.')[1]) >= 8;
+            const r = await rest('/geo-block/admin/channels', { token: session.token, channel: DEFAULT_TOKEN });
+            expect(r.status).toBe(sessionsHaveApiType ? 403 : 200);
+            const ok = await rest('/geo-block/admin/channels', { token: superToken, channel: DEFAULT_TOKEN });
+            expect(ok.status).toBe(200);
         });
 
         it('a channel-B admin cannot simulate against the default channel over REST', async () => {
