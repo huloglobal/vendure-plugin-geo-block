@@ -1624,7 +1624,7 @@ export class GeoBlockComponent implements OnInit, OnDestroy {
     }
 
     // ── Set-up checklist ─────────────────────────────────────────────
-    setup: { items: Array<{ key: string; label: string; done: boolean; hint: string; tab?: string; url?: string }>; complete: boolean } | null = null;
+    setup: { items: Array<{ key: string; label: string; done: boolean; hint: string; tab?: string; url?: string }>; complete: boolean; premium?: boolean } | null = null;
     private setupHiddenKey = 'hulo-vendure-plugin-geo-block-setup-hidden';
     private setupHiddenDoneKey = 'hulo-vendure-plugin-geo-block-setup-hidden-done';
     loadSetup() {
