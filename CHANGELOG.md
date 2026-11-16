@@ -4,6 +4,43 @@ All notable changes to `@huloglobal/vendure-plugin-geo-block` are documented
 here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and this project adheres to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] — 2026-11-16
+
+Improvement round. No migration; existing rules and settings behave as before.
+
+### Changed
+- **Block, closed and maintenance page redesigned** in the shared HULO e-mail/page design: a centred
+  600px white card on `#f3f4f6`, the channel logo or the new `storeName` above a 3px accent bar, a 22px
+  heading, the channel's message, an optional Continue button, the support e-mail and a reference footer.
+  Accessible markup: one `<main>` landmark and one `<h1>` (the card was wrongly an `alertdialog`), the
+  logo's alt text is the store name, visible focus rings, AA contrast for text, links and the button.
+  The page's colour is the new `accentColor` (default `#155dfc`, was a fixed amber); per-reason page
+  titles ("Closed", "Back soon").
+
+### Added
+- `storeName` and `accentColor` init options, also editable in the Settings tab (SuperAdmin), with a
+  "Preview it" link to the block page.
+
+### Fixed
+- **`javascript:` / `data:` URLs from the plain Channel form.** The block redirect and logo custom fields
+  can be edited in Vendure's own Channel form, which does not validate them; a `javascript:` redirect
+  then reached the storefront helper (`window.location.replace`) and the soft-block banner link. Only
+  `http(s)` URLs now leave the server (`/check`, `/site-config`, the block page), and the helper also
+  refuses anything else.
+- **The block page no longer echoes URL text.** `?reason=` was shown as the page reference (40 characters
+  of attacker-chosen text on a store-branded page) and `?country=` accepted any 4 characters. Unknown
+  reasons now show as `geo`; the country must be a two-letter code.
+- **Retry-After during the install-wide maintenance window** now counts down to the window's end (it was
+  always 3600 seconds unless the channel had its own window).
+- **The subdivision map saved over REST is bounded** (ISO country keys, short codes, at most 250 × 200);
+  it was stored unbounded and read on every `/check`.
+- The page escapes single quotes as well.
+
+### Dependencies
+- devDependencies to the latest minor/patch: `@nestjs/common` ^12.5.0, `typeorm` ^0.3.31,
+  `typescript` ^5.9.3, `nodemailer` ^6.10.1. Held: TypeScript 7, TypeORM 1.x and nodemailer 10 (majors;
+  Vendure 3.x is on TypeORM 0.3 and the peer range `nodemailer >=6` is unchanged).
+
 ## [0.15.0] — 2026-11-13
 
 Vendure ↔ WordPress parity wave. **Database migration required** unless you

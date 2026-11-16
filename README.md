@@ -254,6 +254,18 @@ purchase.
 Per-channel `blockMessage`, `blockRedirectUrl`, `blockLogoUrl`. Falls
 back to sensible defaults per block reason.
 
+The same page serves the block, "closed" (business hours) and maintenance
+cases: a centred white card on a light grey background with the channel's
+logo (or the `storeName` option) above a 3px bar in the `accentColor`
+(default `#155dfc`), a heading, the channel's own message, an optional
+**Continue** button to `blockRedirectUrl`, the support e-mail and a short
+reference. It uses one `<main>` landmark and one heading, visible focus
+rings, and keeps the button text readable on light accents (it switches to
+dark text below 4.5:1 contrast). Text from the URL is never shown: unknown
+`?reason=` values become `geo` and `?country=` must be a two-letter code.
+Only `http(s)` redirect and logo URLs are used, even when the custom fields
+were edited in the plain Channel form.
+
 ### Proxy-aware, with a local MaxMind fallback
 
 Reads `cf-ipcountry` / Akamai / Fastly region headers from a trusted
@@ -268,8 +280,8 @@ up. A missing or broken file means "country unknown" (allowed).
 
 `GeoBlockPlugin.init()` options are the defaults; the Settings tab
 (SuperAdmin) overrides the safe ones: crawler mode and custom list,
-`verifyBots`, the support e-mail, the public rate limit, the helper's cache
-age and audit-IP hashing. Reset returns to the init value. Trusted
+`verifyBots`, the support e-mail, the block page's store name and accent
+colour, the public rate limit, the helper's cache age and audit-IP hashing. Reset returns to the init value. Trusted
 headers, the signing secret, the IP salt and the MaxMind path stay in code
 and are shown read-only.
 

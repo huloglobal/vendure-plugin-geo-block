@@ -1,6 +1,6 @@
 {
   "name": "@huloglobal/vendure-plugin-geo-block",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "description": "Per-channel geo-restriction for Vendure storefronts: allow or block by country, region preset, state or province, with server-side purchase enforcement, IPv4/IPv6 allowlist, business hours, per-channel maintenance windows, local MaxMind fallback, verified search-bot allowlist, soft-block mode and a branded block page.",
   "license": "AGPL-3.0-only",
   "author": "Wayne Garrison <wayne@garrison.me.uk>",
@@ -45,11 +45,11 @@
   },
   "devDependencies": {
     "@huloglobal/vendure-licence-sdk": "^0.15.6",
-    "@nestjs/common": "^12.0.1",
+    "@nestjs/common": "^12.5.0",
     "@vendure/core": "3.8.2",
-    "nodemailer": "^6.9.0",
-    "typeorm": "^0.3.0",
-    "typescript": "^5.4.0"
+    "nodemailer": "^6.10.1",
+    "typeorm": "^0.3.31",
+    "typescript": "^5.9.3"
   },
   "keywords": [
     "vendure",
