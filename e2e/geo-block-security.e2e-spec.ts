@@ -178,6 +178,52 @@ describe('geo-block security', () => {
             expect(html).not.toContain('Call +44');
             expect(html).toContain('This service is not available in your country.');
         });
+
+        it('0.16.0: never echoes an unknown ?reason= or a non-ISO ?country=, and renders the card design', async () => {
+            const r = await rest(`/geo-block/blocked?t=${DEFAULT_TOKEN}&reason=${encodeURIComponent('Call 0800 000 000')}&country=${encodeURIComponent('<b>')}`);
+            const html = await r.text();
+            expect(html).not.toContain('Call 0800');
+            expect(html).not.toContain('&lt;b&gt;');
+            expect(html).toContain('Reference: <span class="mono">geo</span>');
+            expect(html).toContain('<html lang="en">');
+            expect(html).toContain('--accent: #155dfc');
+        });
+
+        it('0.16.0: a javascript: redirect or data: logo saved in the plain Channel form never reaches /check or the page', async () => {
+            const { activeChannel } = await adminClient.query(gql`query { activeChannel { id } }`);
+            // A REST save invalidates the 10 s rules cache (and refuses the javascript: URL itself);
+            // the plain Channel form then writes the bad values straight into the columns.
+            await saveRules(superToken, DEFAULT_TOKEN, { enabled: true, extraAllowed: ['GB', 'FR'], ipAllowlist: ['192.0.2.10'], blockRedirectUrl: 'javascript:alert(1)' });
+            await adminClient.query(gql`
+                mutation ($id: ID!) {
+                    updateChannel(input: { id: $id, customFields: { geoBlockBlockRedirectUrl: "javascript:alert(document.cookie)", geoBlockBlockLogoUrl: "data:image/svg+xml,x" } }) { ... on Channel { id } }
+                }`, { id: activeChannel.id });
+            const v = await (await rest('/geo-block/check?country=US', { channel: DEFAULT_TOKEN })).json();
+            expect(v.allowed).toBe(false);
+            expect(v.redirectUrl).toBeNull();
+            expect(v.logoUrl).toBeNull();
+            const cfg = await (await rest('/geo-block/site-config', { channel: DEFAULT_TOKEN })).json();
+            expect(cfg.geoBlock.blockRedirectUrl).toBeNull();
+            const html = await (await rest(`/geo-block/blocked?t=${DEFAULT_TOKEN}&reason=country-not-allowed`)).text();
+            expect(html).not.toContain('javascript:');
+            expect(html).not.toContain('data:image');
+            await adminClient.query(gql`
+                mutation ($id: ID!) {
+                    updateChannel(input: { id: $id, customFields: { geoBlockBlockRedirectUrl: null, geoBlockBlockLogoUrl: null } }) { ... on Channel { id } }
+                }`, { id: activeChannel.id });
+        });
+
+        it('0.16.0: the store name and accent colour from the settings appear on the page', async () => {
+            const bad = await rest('/geo-block/admin/settings', { token: superToken, channel: DEFAULT_TOKEN, method: 'POST', body: { accentColor: 'red' } });
+            expect(bad.status).toBe(400);
+            // (sql.js cannot persist the prefs row, so the save is checked in-process, last.)
+            const saved = await rest('/geo-block/admin/settings', { token: superToken, channel: DEFAULT_TOKEN, method: 'POST', body: { storeName: 'Acme <Shop>', accentColor: '#0F766E' } });
+            expect((await saved.json()).effective).toMatchObject({ storeName: 'Acme <Shop>', accentColor: '#0f766e' });
+            const html = await (await rest('/geo-block/blocked?reason=maintenance')).text();
+            expect(html).toContain('<span class="store">Acme &lt;Shop&gt;</span>');
+            expect(html).toContain('--accent: #0f766e');
+            await rest('/geo-block/admin/settings', { token: superToken, channel: DEFAULT_TOKEN, method: 'POST', body: { storeName: null, accentColor: null } });
+        });
     });
 
     describe('/geo-block/check', () => {

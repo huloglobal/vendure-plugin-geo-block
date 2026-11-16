@@ -96,6 +96,12 @@ export interface GeoBlockPluginOptions {
     /** Optional support email surfaced on the branded block page.
      *  Rendered inline as "Questions? <email>". Empty = no link. */
     supportEmail?: string;
+    /** Store name shown at the top of the block and maintenance page when no
+     *  channel logo is set (and as the logo's alt text). Empty = no name. */
+    storeName?: string;
+    /** Accent colour of the block and maintenance page (`#rrggbb`): the bar
+     *  under the header, the button and links. Default `#155dfc`. */
+    accentColor?: string;
     /** Cache-Control max-age (seconds) for the storefront helper JS.
      *  Default 300. Public + stale-while-revalidate. */
     storefrontHelperMaxAgeSec?: number;

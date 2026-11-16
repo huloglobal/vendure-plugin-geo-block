@@ -22,7 +22,7 @@ import {
     resolveAllowedCountries,
 } from './geo-regions';
 import {
-    buildConfig, DEFAULT_SITE_CONFIG, GeoBlockChannelRules, parseJsonSafely, parseList, parseMaintenance, parseSubdivisions, rulesFromRow, SiteConfig,
+    buildConfig, DEFAULT_SITE_CONFIG, GeoBlockChannelRules, parseJsonSafely, parseList, parseMaintenance, parseSubdivisions, rulesFromRow, safeHttpUrl, SiteConfig,
 } from './channel-rules';
 import { decide, defaultMessage, httpStatusFor, inWindow, sanitiseMaintenance, sanitiseSchedule, Verdict } from './decision';
 import { CrawlerVerifier, claimedVerifiableBot } from './bot-verify';
@@ -37,7 +37,7 @@ import { isAllowlistedBot } from './bot-detect';
 import { BusinessHoursSchedule, checkSchedule } from './schedule';
 
 const DEFAULTS = DEFAULT_SITE_CONFIG;
-import { buildHuloGeoJs, buildBlockedPageHtml } from './storefront-assets';
+import { buildHuloGeoJs, buildBlockedPageHtml, normaliseBlockedReason } from './storefront-assets';
 import { GeoBlockEngagementService, PREMIUM_FEATURES } from './engagement';
 
 const PLUGIN_ID_FOR_STORE = 'vendure-plugin-geo-block';
@@ -48,16 +48,6 @@ const loggerCtx = 'GeoBlockController';
 
 /** Per-install audit-IP salt resolved at boot when `ipSalt` is not configured (cached per process). */
 let generatedIpSalt: string | null = null;
-
-/** Minimal HTML-escape for user-supplied text going into the block
- *  page template. */
-function escapeHtml(s: string): string {
-    return String(s ?? '')
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
-}
 
 function requireAdmin(ctx: RequestContext, res: Response, write: boolean | 'super' = false): boolean {
     if (!ctx?.activeUserId) {
@@ -670,12 +660,16 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
         // and re-serialise to JSON for storage.
         const normSubdivisions = (raw: any): string => {
             if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return '{}';
+            // Bounded: country keys are ISO codes, subdivision codes are short
+            // alphanumerics, at most 250 countries x 200 codes (the TEXT column
+            // is read on every /check).
             const out: Record<string, string[]> = {};
-            for (const [k, v] of Object.entries(raw)) {
-                if (!Array.isArray(v)) continue;
+            for (const [k, v] of Object.entries(raw).slice(0, 250)) {
+                const key = String(k).trim().toUpperCase();
+                if (!Array.isArray(v) || !/^[A-Z]{2}$/.test(key)) continue;
                 const codes = v.filter(x => typeof x === 'string')
-                    .map(x => x.trim().toUpperCase()).filter(Boolean);
-                if (codes.length) out[String(k).toUpperCase()] = Array.from(new Set(codes));
+                    .map(x => x.trim().toUpperCase()).filter(x => /^[A-Z0-9]{1,6}$/.test(x)).slice(0, 200);
+                if (codes.length) out[key] = Array.from(new Set(codes));
             }
             return JSON.stringify(out);
         };
@@ -816,6 +810,7 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
                 botMode: eff.botMode, botCustom: eff.botCustom, verifyBots: eff.verifyBots,
                 supportEmail: eff.supportEmail, rateLimitPerMinute: Math.round(eff.rateLimit.capacity * 60_000 / eff.rateLimit.windowMs),
                 hashAuditIps: eff.hashAuditIps, storefrontHelperMaxAgeSec: eff.storefrontHelperMaxAgeSec,
+                storeName: eff.storeName, accentColor: eff.accentColor,
             },
             overrides: getOverrides(),
             readOnly: {
@@ -992,20 +987,25 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
         applySecurityHeaders(res);
         if (this.rateLimited(req, res, 'blocked')) return;
 
-        const token = String((req.query as any).t || '').trim();
-        const reason = String((req.query as any).reason || 'geo').slice(0, 40);
-        const country = String((req.query as any).country || '').slice(0, 4).toUpperCase();
+        const token = String((req.query as any).t || '').trim().slice(0, 200);
+        // Only reasons the page knows; never text from the URL on a store-branded page.
+        const reason = normaliseBlockedReason((req.query as any).reason || 'geo');
+        const rawCountry = String((req.query as any).country || '').trim().toUpperCase();
+        const country = /^[A-Z]{2}$/.test(rawCountry) ? rawCountry : '';
         const opts = getOptions();
 
         let logoUrl: string | null = null;
         let redirectUrl: string | null = null;
         let msg = '';
         let retryAfterSec = 3600;
+        if (reason === 'maintenance' && opts.maintenanceWindow && inWindow(opts.maintenanceWindow)) {
+            retryAfterSec = Math.max(60, Math.min(86_400, Math.ceil((Date.parse(opts.maintenanceWindow.endsAt) - Date.now()) / 1000) || 3600));
+        }
         if (token) {
             const row = await this.rules.load(token);
             if (row) {
-                logoUrl = row.blockLogoUrl || null;
-                redirectUrl = row.blockRedirectUrl || null;
+                logoUrl = safeHttpUrl(row.blockLogoUrl);
+                redirectUrl = safeHttpUrl(row.blockRedirectUrl);
                 if (reason === 'maintenance') {
                     const m = parseMaintenance(row.maintenance);
                     if (m?.message && inWindow(m)) msg = String(m.message).slice(0, 400);
@@ -1025,15 +1025,16 @@ export class GeoBlockController implements OnApplicationBootstrap, OnModuleDestr
             return res.json({ reason, country: country || null, message: msg, logoUrl, redirectUrl });
         }
 
+        const settings = effectiveSettings();
         const html = buildBlockedPageHtml({
-            title: 'Not available in your region',
-            heading: reason === 'schedule' ? 'Sorry, we’re closed' : (reason === 'maintenance' ? 'Back soon' : 'Sorry, this store is not available'),
-            message: escapeHtml(msg),
-            reason: escapeHtml(reason),
-            country: country ? escapeHtml(country) : null,
-            logoUrl: logoUrl ? escapeHtml(logoUrl) : null,
-            redirectUrl: redirectUrl ? escapeHtml(redirectUrl) : null,
-            supportEmail: effectiveSettings().supportEmail ? escapeHtml(effectiveSettings().supportEmail) : null,
+            reason,
+            message: msg,
+            country: country || null,
+            logoUrl,
+            redirectUrl,
+            supportEmail: settings.supportEmail || null,
+            storeName: settings.storeName || null,
+            accentColor: settings.accentColor,
         });
         // The HTML block page is not content: 403 for a geo refusal, 503 with
         // Retry-After while closed (business hours) or in maintenance, so

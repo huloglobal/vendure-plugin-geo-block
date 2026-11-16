@@ -669,7 +669,10 @@ interface PresetMeta { key: string; label: string; kind: string; description: st
                                 <div><label>Rate limit <small>(requests/min per IP, public endpoints)</small></label><input class="form-input" type="number" min="10" max="10000" [(ngModel)]="settingsForm.rateLimitPerMinute"></div>
                                 <div><label>Storefront helper cache <small>(seconds)</small></label><input class="form-input" type="number" min="60" max="86400" [(ngModel)]="settingsForm.storefrontHelperMaxAgeSec"></div>
                                 <div><label>Support e-mail on the block page</label><input class="form-input" type="email" [(ngModel)]="settingsForm.supportEmail" placeholder="help@example.com"></div>
+                                <div><label>Store name on the block page <small>(shown when the channel has no logo)</small></label><input class="form-input" type="text" maxlength="120" [(ngModel)]="settingsForm.storeName" placeholder="Your store"></div>
+                                <div><label>Block page accent colour</label><input class="form-input mono" type="text" maxlength="7" [(ngModel)]="settingsForm.accentColor" placeholder="#155dfc"></div>
                             </div>
+                            <p class="hint">The block, closed and maintenance page is a centred card with the channel's logo (or the store name), an accent bar, the channel's message and the support e-mail. <a href="/geo-block/blocked?reason=country-not-allowed" target="_blank" rel="noopener">Preview it</a>.</p>
                             <label class="chk"><input type="checkbox" [(ngModel)]="settingsForm.hashAuditIps"> Store hashed (not raw) IPs in the audit log</label>
                             <div style="display:flex; gap:8px; margin-top:12px; flex-wrap:wrap">
                                 <button class="gbtn gbtn-primary gbtn-sm" (click)="saveSettings()" [disabled]="settingsSaving">{{ settingsSaving ? 'Saving…' : 'Save settings' }}</button>
@@ -2113,6 +2116,8 @@ export class GeoBlockComponent implements OnInit, OnDestroy {
         set('rateLimitPerMinute', Number(f.rateLimitPerMinute));
         set('storefrontHelperMaxAgeSec', Number(f.storefrontHelperMaxAgeSec));
         set('supportEmail', String(f.supportEmail || '').trim());
+        set('storeName', String(f.storeName || '').trim());
+        set('accentColor', String(f.accentColor || '').trim().toLowerCase());
         set('hashAuditIps', !!f.hashAuditIps);
         this.postSettings(patch, 'Settings saved');
     }

@@ -59,6 +59,8 @@ export function buildHuloGeoJs(opts: HeloOpts): string {
   var timeoutMs = parseInt(s.getAttribute('data-timeout-ms') || '3000', 10);
   if (!token) { if (preview) console.warn('[hulo-geo] missing data-channel-token'); return; }
   var base = ${JSON.stringify(publicBaseUrl)};
+  // Only http(s) targets are followed (the server already filters them).
+  function safeUrl(u) { u = String(u || ''); return /^https?:\/\//i.test(u) ? u : null; }
   function log() { if (preview) try { console.info.apply(console, ['[hulo-geo]'].concat([].slice.call(arguments))); } catch (e) {} }
   function go() {
     var url = base + '/geo-block/check';
@@ -75,14 +77,14 @@ export function buildHuloGeoJs(opts: HeloOpts): string {
       if (preview) return;
       var mode = v.mode || 'block';
       if (mode === 'block') {
-        var target = override || v.redirectUrl
+        var target = override || safeUrl(v.redirectUrl)
           || (base + '/geo-block/blocked?reason=' + encodeURIComponent(v.reason || 'geo')
               + (v.message ? '&msg=' + encodeURIComponent(v.message) : '')
               + '&t=' + encodeURIComponent(token));
         window.location.replace(target);
       } else if (mode === 'soft') {
         injectBanner(v.message || 'This site does not currently ship to your region.',
-          override || v.redirectUrl || null);
+          override || safeUrl(v.redirectUrl));
       }
     }).catch(function (e) { log('fetch error — failing open', e && e.message); });
   }
@@ -115,75 +117,146 @@ export function buildHuloGeoJs(opts: HeloOpts): string {
 `;
 }
 
+export type BlockedPageReason = 'country-not-allowed' | 'denylist' | 'uk-region-not-allowed' | 'subdivision-not-allowed' | 'schedule' | 'maintenance' | 'geo';
+
+/** Reasons the block page knows. Anything else in `?reason=` becomes `geo`,
+ *  so the page never echoes text from the URL. */
+export const BLOCKED_PAGE_REASONS: readonly BlockedPageReason[] = [
+    'country-not-allowed', 'denylist', 'uk-region-not-allowed', 'subdivision-not-allowed', 'schedule', 'maintenance', 'geo',
+];
+
+export function normaliseBlockedReason(raw: any): BlockedPageReason {
+    const r = String(raw ?? '').trim().toLowerCase();
+    return (BLOCKED_PAGE_REASONS as readonly string[]).includes(r) ? r as BlockedPageReason : 'geo';
+}
+
+/** HTML-escape for text and double- or single-quoted attributes. */
+export function escapeHtml(s: any): string {
+    return String(s ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function channelLuminance(c: number): number {
+    const v = c / 255;
+    return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+}
+
+/** WCAG relative luminance of `#rrggbb`. */
+export function relativeLuminance(hex: string): number {
+    const h = hex.replace('#', '');
+    const [r, g, b] = [0, 2, 4].map(i => parseInt(h.slice(i, i + 2), 16));
+    return 0.2126 * channelLuminance(r) + 0.7152 * channelLuminance(g) + 0.0722 * channelLuminance(b);
+}
+
+export function contrastRatio(a: string, b: string): number {
+    const [l1, l2] = [relativeLuminance(a), relativeLuminance(b)].sort((x, y) => y - x);
+    return (l1 + 0.05) / (l2 + 0.05);
+}
+
+/** Text colour for a button filled with `accent`: white unless the accent is
+ *  too light for white text (WCAG AA 4.5:1), then near-black. */
+export function onAccentText(accent: string): string {
+    return contrastRatio(accent, '#ffffff') >= 4.5 ? '#ffffff' : '#111827';
+}
+
+/** Link colour on the white card: the accent when it is readable on white,
+ *  otherwise the body ink (links stay underlined either way). */
+export function linkColourOnWhite(accent: string): string {
+    return contrastRatio(accent, '#ffffff') >= 4.5 ? accent : '#111827';
+}
+
+const PAGE_COPY: Record<BlockedPageReason, { label: string; heading: string; title: string }> = {
+    'country-not-allowed': { label: 'Not available', heading: 'Sorry, this store is not available', title: 'Not available in your region' },
+    'denylist': { label: 'Not available', heading: 'Sorry, this store is not available', title: 'Not available in your region' },
+    'uk-region-not-allowed': { label: 'Not available', heading: 'Sorry, this store is not available', title: 'Not available in your region' },
+    'subdivision-not-allowed': { label: 'Not available', heading: 'Sorry, this store is not available', title: 'Not available in your region' },
+    'geo': { label: 'Not available', heading: 'Sorry, this store is not available', title: 'Not available in your region' },
+    'schedule': { label: 'Closed', heading: 'Sorry, we’re closed', title: 'Closed' },
+    'maintenance': { label: 'Maintenance', heading: 'Back soon', title: 'Back soon' },
+};
+
 /**
- * Branded, self-contained HTML block page. Rendered when a visitor
- * hits `/geo-block/blocked?reason=X&msg=…&t=<token>`. Zero dependencies —
- * inline CSS + one image reference (channel logo, optional).
+ * The visitor-facing block, closed and maintenance page: a centred white
+ * card on a light grey background (the same design as the plugin's e-mails),
+ * with the merchant's logo or store name over a 3px accent bar, the channel's
+ * own message, an optional "Continue" button and the support address.
  *
- * Rendered per-request so we can localise the country name and echo
- * the operator's custom message. Safe for browser display — every
- * dynamic value is HTML-escaped at the call site.
+ * Takes RAW values and escapes every one of them here. URLs must already be
+ * filtered to http(s) (`safeHttpUrl`); the accent must be a `#rrggbb` colour.
+ * Accessible: `lang`, one `<main>` landmark with one `<h1>`, the reference in
+ * a footer, visible focus rings, AA contrast for text, links and the button.
  */
 export function buildBlockedPageHtml(input: {
-    title: string;
-    heading: string;
+    reason: BlockedPageReason;
     message: string;
-    reason: string;
     country?: string | null;
     logoUrl?: string | null;
     redirectUrl?: string | null;
     supportEmail?: string | null;
+    storeName?: string | null;
+    accentColor?: string | null;
 }): string {
-    const {
-        title,
-        heading,
-        message,
-        reason,
-        country,
-        logoUrl,
-        redirectUrl,
-        supportEmail,
-    } = input;
-    // Everything below is already HTML-escaped by the caller. Keep
-    // this template literal-only — no template-time substitution.
+    const reason = normaliseBlockedReason(input.reason);
+    const copy = PAGE_COPY[reason];
+    const accent = /^#[0-9a-f]{6}$/i.test(String(input.accentColor || '')) ? String(input.accentColor).toLowerCase() : '#155dfc';
+    const onAccent = onAccentText(accent);
+    const link = linkColourOnWhite(accent);
+    const store = String(input.storeName || '').trim();
+    const country = /^[A-Z]{2}$/.test(String(input.country || '')) ? String(input.country) : '';
+    const e = escapeHtml;
+    const brand = input.logoUrl
+        ? `<img class="logo" src="${e(input.logoUrl)}" alt="${e(store)}" width="160" height="48">`
+        : (store ? `<span class="store">${e(store)}</span>` : '');
+    const title = store ? `${copy.title} · ${store}` : copy.title;
     return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="robots" content="noindex, nofollow">
-  <title>${title}</title>
+  <title>${e(title)}</title>
   <style>
-    :root {
-      --bg: #f8fafc; --ink: #0f172a; --ink-2: #475569; --card: #ffffff;
-      --accent: #f59e0b; --accent-dark: #d97706; --border: #e2e8f0;
-    }
+    :root { --accent: ${accent}; --on-accent: ${onAccent}; --link: ${link}; }
     * { box-sizing: border-box; }
-    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink); font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; -webkit-font-smoothing: antialiased; }
-    .wrap { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
-    .card { background: var(--card); border: 1px solid var(--border); border-radius: 18px; max-width: 560px; width: 100%; padding: 40px 32px; box-shadow: 0 1px 3px rgba(15,23,42,.05), 0 8px 24px rgba(15,23,42,.04); text-align: center; }
-    .logo { max-width: 140px; height: auto; margin: 0 auto 20px; display: block; }
-    .badge { display: inline-block; margin-bottom: 18px; padding: 6px 12px; border-radius: 999px; background: #fef3c7; color: #92400e; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; font-weight: 700; }
-    h1 { font-size: 26px; line-height: 1.2; margin: 0 0 12px; letter-spacing: -.01em; color: var(--ink); }
-    p { color: var(--ink-2); margin: 0 0 18px; line-height: 1.55; font-size: 15px; }
-    .country { color: var(--ink); font-weight: 600; }
-    .cta { display: inline-block; margin-top: 6px; padding: 12px 22px; border-radius: 10px; background: var(--accent); color: #fff; text-decoration: none; font-weight: 700; }
-    .cta:hover { background: var(--accent-dark); }
-    .support { margin-top: 22px; font-size: 13px; color: var(--ink-2); }
-    .support a { color: var(--accent-dark); }
-    .footer { margin-top: 28px; padding-top: 20px; border-top: 1px solid var(--border); font-size: 12px; color: #94a3b8; }
+    html, body { margin: 0; padding: 0; background: #f3f4f6; color: #374151; font-family: Arial, Helvetica, sans-serif; -webkit-font-smoothing: antialiased; }
+    .wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px 16px; }
+    .card { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 10px; width: 100%; max-width: 600px; overflow: hidden; }
+    .brand { padding: 22px 28px; border-bottom: 3px solid var(--accent); min-height: 24px; }
+    .logo { display: block; width: auto; height: auto; max-width: 160px; max-height: 48px; }
+    .store { font-size: 18px; font-weight: bold; color: #111827; }
+    .body { padding: 28px; }
+    .lbl { display: block; font-size: 12px; font-weight: bold; color: #6b7280; text-transform: uppercase; letter-spacing: 1px; margin: 0 0 8px; }
+    h1 { font-size: 22px; line-height: 28px; font-weight: bold; color: #111827; margin: 0 0 10px; }
+    p { font-size: 14px; line-height: 22px; margin: 0 0 16px; }
+    .info { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px 16px; margin: 0 0 16px; font-size: 14px; color: #111827; }
+    .info .lbl { margin-bottom: 4px; }
+    .mono { font-family: Consolas, Menlo, monospace; }
+    .btn { display: inline-block; background: var(--accent); color: var(--on-accent); font-size: 15px; font-weight: bold; text-decoration: none; padding: 13px 26px; border-radius: 8px; }
+    .btn:hover { filter: brightness(.95); }
+    a { color: var(--link); }
+    a:focus-visible, .btn:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+    .help { font-size: 14px; line-height: 22px; margin: 18px 0 0; }
+    .foot { background: #f9fafb; border-top: 1px solid #e5e7eb; padding: 14px 28px; font-size: 11px; line-height: 16px; color: #6b7280; }
+    @media (max-width: 480px) { .brand, .body { padding-left: 20px; padding-right: 20px; } .foot { padding-left: 20px; padding-right: 20px; } }
   </style>
 </head>
 <body>
   <main class="wrap">
-    <div class="card" role="alertdialog" aria-labelledby="h">
-      ${logoUrl ? `<img class="logo" src="${logoUrl}" alt="" aria-hidden="true">` : ''}
-      <span class="badge">Not available</span>
-      <h1 id="h">${heading}</h1>
-      <p>${message}${country ? ` <span class="country">(${country})</span>` : ''}</p>
-      ${redirectUrl ? `<a class="cta" href="${redirectUrl}">Continue</a>` : ''}
-      ${supportEmail ? `<div class="support">Questions? <a href="mailto:${supportEmail}">${supportEmail}</a></div>` : ''}
-      <div class="footer">Ref: ${reason}</div>
+    <div class="card">
+      <header class="brand">${brand}</header>
+      <div class="body">
+        <span class="lbl">${e(copy.label)}</span>
+        <h1>${e(copy.heading)}</h1>
+        <p>${e(input.message)}</p>
+        ${country ? `<div class="info"><span class="lbl">Your location</span><span class="mono">${e(country)}</span></div>` : ''}
+        ${input.redirectUrl ? `<a class="btn" href="${e(input.redirectUrl)}">Continue</a>` : ''}
+        ${input.supportEmail ? `<p class="help">Questions? E-mail <a href="mailto:${e(input.supportEmail)}">${e(input.supportEmail)}</a>.</p>` : ''}
+      </div>
+      <footer class="foot">Reference: <span class="mono">${e(reason)}</span></footer>
     </div>
   </main>
 </body>

@@ -91,6 +91,18 @@ export const DEFAULT_SITE_CONFIG: SiteConfig = {
     companyData: { showCompanyNumber: false, companyNumber: '' },
 };
 
+/** An absolute http(s) URL (trimmed, at most 2048 characters), else null. */
+export function safeHttpUrl(raw: any): string | null {
+    const v = String(raw ?? '').trim();
+    if (!v || v.length > 2048 || /[\s<>"'`\\]/.test(v)) return null;
+    try {
+        const u = new URL(v);
+        return u.protocol === 'http:' || u.protocol === 'https:' ? v : null;
+    } catch {
+        return null;
+    }
+}
+
 /** Rules for one channel as the storefront and `/check` see them.
  *  Tier gate: unlicensed installs (evaluation expired) force `mode=block`
  *  (no soft-block banner) and ignore the saved subdivision map. The block
@@ -112,8 +124,12 @@ export function buildConfig(token: string, r: any, premium: boolean): SiteConfig
             allowedSubdivisions: premium ? parseSubdivisions(r.allowedSubdivisionsJson) : {},
             allowedRegions,
             blockMessage: String(r.blockMessage || ''),
-            blockRedirectUrl: r.blockRedirectUrl || null,
-            blockLogoUrl: r.blockLogoUrl || null,
+            // The channel custom fields can also be edited in the standard
+            // Channel form, which does not validate them: only http(s) URLs
+            // ever reach the storefront helper (redirect / banner link) or
+            // the block page, never `javascript:` or `data:`.
+            blockRedirectUrl: safeHttpUrl(r.blockRedirectUrl),
+            blockLogoUrl: safeHttpUrl(r.blockLogoUrl),
         },
         companyData: {
             showCompanyNumber: !!Number(r.showCompanyNumber || 0),

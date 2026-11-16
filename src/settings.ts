@@ -30,6 +30,22 @@ export interface AdminOverrides {
     rateLimitPerMinute?: number;
     hashAuditIps?: boolean;
     storefrontHelperMaxAgeSec?: number;
+    /** Store name shown on the block page when no logo is set. */
+    storeName?: string;
+    /** Block-page accent colour, `#rrggbb`. */
+    accentColor?: string;
+}
+
+/** Block-page accent when none is configured (shared HULO e-mail/page design). */
+export const DEFAULT_ACCENT_COLOR = '#155dfc';
+
+/** `#rgb` / `#rrggbb` → lower-case `#rrggbb`, or null when not a hex colour. */
+export function normaliseHexColor(raw: any): string | null {
+    const v = String(raw ?? '').trim().toLowerCase();
+    const m = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/.exec(v);
+    if (!m) return null;
+    const h = m[1].length === 3 ? m[1].split('').map(c => c + c).join('') : m[1];
+    return `#${h}`;
 }
 
 export interface EffectiveSettings {
@@ -41,6 +57,8 @@ export interface EffectiveSettings {
     rateLimit: { capacity: number; windowMs: number };
     hashAuditIps: boolean;
     storefrontHelperMaxAgeSec: number;
+    storeName: string;
+    accentColor: string;
 }
 
 let overrides: AdminOverrides = {};
@@ -97,6 +115,18 @@ export function sanitiseOverrides(current: AdminOverrides, patch: any): AdminOve
             out.storefrontHelperMaxAgeSec = n;
         }
     }
+    if ('storeName' in patch) {
+        if (patch.storeName === null) clear('storeName');
+        else out.storeName = String(patch.storeName || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 120);
+    }
+    if ('accentColor' in patch) {
+        if (patch.accentColor === null || patch.accentColor === '') clear('accentColor');
+        else {
+            const c = normaliseHexColor(patch.accentColor);
+            if (!c) throw new Error('The accent colour must be a hex colour such as #155dfc');
+            out.accentColor = c;
+        }
+    }
     return out;
 }
 
@@ -130,6 +160,8 @@ export function effectiveSettings(): EffectiveSettings {
         rateLimit: perMinute ? { capacity: perMinute, windowMs: 60_000 } : (o.rateLimit || { capacity: 120, windowMs: 60_000 }),
         hashAuditIps: overrides.hashAuditIps ?? (o.hashAuditIps !== false),
         storefrontHelperMaxAgeSec: overrides.storefrontHelperMaxAgeSec ?? Math.max(60, o.storefrontHelperMaxAgeSec ?? 300),
+        storeName: overrides.storeName ?? String(o.storeName || '').trim().slice(0, 120),
+        accentColor: overrides.accentColor ?? normaliseHexColor(o.accentColor) ?? DEFAULT_ACCENT_COLOR,
     };
 }
 
